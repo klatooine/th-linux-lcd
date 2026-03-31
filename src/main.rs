@@ -1,3 +1,12 @@
+mod daemon;
+mod gui;
+mod shared;
+mod usb;
+
 fn main() {
-    println!("Hello, world!");
+    if std::env::args().any(|a| a == "--daemon") {
+        daemon::run();
+    } else {
+        gui::run();
+    }
 }

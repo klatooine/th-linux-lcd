@@ -1,0 +1,12 @@
+[Unit]
+Description=Thermaltake TH LCD Daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/th-linux-lcd --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
