@@ -1,0 +1,3 @@
+# Thermaltake TH420V2 Ultra LCD (VID 0x264a, PID 0x233c)
+# Allow access to members of the 'plugdev' group without root.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="233c", MODE="0660", GROUP="plugdev"

@@ -1,0 +1,24 @@
+post_install() {
+    echo "==> Reloading udev rules..."
+    udevadm control --reload-rules
+    udevadm trigger
+
+    echo ""
+    echo "==> Add your user to the 'plugdev' group for non-root USB access:"
+    echo "      sudo usermod -aG plugdev \$USER"
+    echo "    Then log out and back in."
+    echo ""
+    echo "==> To enable the background daemon (recommended):"
+    echo "      systemctl --user enable --now th-linux-lcd"
+    echo ""
+    echo "==> Or just launch the app — it will start the daemon automatically."
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    echo "==> Stopping and disabling th-linux-lcd daemon..."
+    systemctl --user disable --now th-linux-lcd 2>/dev/null || true
+}

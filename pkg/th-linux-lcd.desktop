@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=TH Linux LCD
+Comment=Thermaltake TH420V2 Ultra LCD controller
+Exec=th-linux-lcd
+Icon=th-linux-lcd
+Terminal=false
+Type=Application
+Categories=System;HardwareSettings;
+Keywords=thermaltake;lcd;cooling;

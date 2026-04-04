@@ -231,59 +231,64 @@ impl App {
     fn rotate_video(&mut self, id: &str, delta: i32) {
         let Some(v) = self.videos.iter_mut().find(|v| v.id == id) else { return };
         v.rotation = (v.rotation + delta).rem_euclid(360);
+        let new_rot = v.rotation;
+        // Invalidate cached rotated frames so next play regenerates them
+        let rotated_dir = frames_dir(&self.data_dir, id).with_file_name(format!("{}-rotated", id));
+        let _ = std::fs::remove_dir_all(&rotated_dir);
+        save_videos(&self.data_dir, &self.videos);
+        self.status_msg = format!("Rotation: {}°", new_rot);
+    }
+
+    /// Returns the frames dir to use for playback — original if rotation=0,
+    /// otherwise generates rotated copies into a sibling "-rotated" dir.
+    fn prepare_play_dir(&mut self, id: &str) -> Option<(PathBuf, usize)> {
+        let v = self.videos.iter().find(|v| v.id == id)?;
         let rotation = v.rotation;
         let count = v.frame_count;
-        let fdir = frames_dir(&self.data_dir, id).display().to_string();
+        let src_dir = frames_dir(&self.data_dir, id);
 
-        self.status_msg = "Rotating...".into();
+        if rotation == 0 {
+            return Some((src_dir, count));
+        }
+
+        let dst_dir = src_dir.with_file_name(format!("{}-rotated", id));
+        let src_s = src_dir.display().to_string();
+        let dst_s = dst_dir.display().to_string();
+
+        self.status_msg = "Applying rotation...".into();
 
         let script = format!(r#"
 from PIL import Image
 import io, os
-fdir = {fdir:?}
+src={src:?}; dst={dst:?}
+os.makedirs(dst, exist_ok=True)
 for i in range(1, {count}+1):
-    p = os.path.join(fdir, f'f{{i:05}}.jpg')
+    p = os.path.join(src, f'f{{i:05}}.jpg')
     if not os.path.exists(p): continue
-    img = Image.open(p).rotate(-{rotation}, expand=False)
+    img = Image.open(p).rotate(-{rot}, expand=False)
     q = 25
     while q >= 5:
         b = io.BytesIO()
         img.save(b, 'JPEG', quality=q, subsampling='4:4:4', dpi=(96,96))
         if len(b.getvalue()) <= 20480 or q <= 5:
-            open(p, 'wb').write(b.getvalue())
+            open(os.path.join(dst, f'f{{i:05}}.jpg'), 'wb').write(b.getvalue())
             break
         q -= 5
-"#, fdir = fdir, count = count, rotation = rotation);
+"#, src = src_s, dst = dst_s, count = count, rot = rotation);
 
-        let res = std::process::Command::new("python3").args(["-c", &script]).output();
-        match res {
+        match std::process::Command::new("python3").args(["-c", &script]).output() {
             Ok(o) if o.status.success() => {
-                // Update thumbnail from first frame
-                let thumb_path = frames_dir(&self.data_dir, id).join("f00001.jpg");
-                let thumb = make_thumbnail(&thumb_path);
-                if let Some(v) = self.videos.iter_mut().find(|v| v.id == id) {
-                    v.thumbnail = thumb;
-                }
-                save_videos(&self.data_dir, &self.videos);
-                self.thumb_cache.remove(id);
-                self.preview_texture = None;
-                self.preview_frame_idx = 0;
-                self.status_msg = format!("Rotated to {}°", rotation);
-
-                // If this video is currently playing, reload frames in daemon
-                if self.daemon_status.playing_id.as_deref() == Some(id) {
-                    if let Some(v) = self.videos.iter().find(|v| v.id == id) {
-                        self.send(Cmd::Play {
-                            frames_dir: frames_dir(&self.data_dir, id).display().to_string(),
-                            fps: v.fps,
-                            frame_count: v.frame_count,
-                            id: id.to_string(),
-                        });
-                    }
-                }
+                self.status_msg = "Streaming".into();
+                Some((dst_dir, count))
             }
-            Ok(o) => self.status_msg = format!("Rotate failed: {}", String::from_utf8_lossy(&o.stderr)),
-            Err(e) => self.status_msg = format!("Error: {}", e),
+            Ok(o) => {
+                self.status_msg = format!("Rotate failed: {}", String::from_utf8_lossy(&o.stderr));
+                None
+            }
+            Err(e) => {
+                self.status_msg = format!("Error: {}", e);
+                None
+            }
         }
     }
 
@@ -432,6 +437,12 @@ fn gallery_card(
     size: f32,
 ) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
+    let del_rect = egui::Rect::from_min_size(egui::pos2(rect.max.x - 18.0, rect.min.y), Vec2::splat(18.0));
+
+    // Always register delete interaction so egui tracks hover/click on it
+    let del_resp = ui.interact(del_rect, egui::Id::new(("del", id)), egui::Sense::click());
+
+    let hovered = resp.hovered() || del_resp.hovered();
     let p = ui.painter();
 
     p.rect_filled(rect, 4.0, if selected { BG_SEL } else { BG_CARD });
@@ -441,28 +452,29 @@ fn gallery_card(
     if let Some(tid) = tex {
         let img_r = rect.shrink(4.0).with_max_y(rect.max.y - 17.0);
         p.image(tid, img_r,
-            egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             Color32::WHITE);
     }
 
-    let name_r = egui::Rect::from_min_max(
-        egui::pos2(rect.min.x, rect.max.y - 17.0), rect.max);
+    let name_r = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 17.0), rect.max);
     p.rect_filled(name_r, egui::Rounding { sw: 4.0, se: 4.0, ..Default::default() },
         Color32::from_black_alpha(210));
-    p.text(name_r.center(), egui::Align2::CENTER_CENTER, name,
+    let label: std::borrow::Cow<str> = if name.chars().count() > 13 {
+        format!("{}…", name.chars().take(12).collect::<String>()).into()
+    } else {
+        name.into()
+    };
+    p.text(name_r.center(), egui::Align2::CENTER_CENTER, label.as_ref(),
         FontId::monospace(8.0), if selected { GREEN } else { TEXT_DIM });
 
-    let mut del_clicked = false;
-    if resp.hovered() {
-        let dr = egui::Rect::from_min_size(egui::pos2(rect.max.x - 18.0, rect.min.y), Vec2::splat(18.0));
-        p.rect_filled(dr, egui::Rounding { ne: 4.0, ..Default::default() },
+    if hovered {
+        p.rect_filled(del_rect, egui::Rounding { ne: 4.0, ..Default::default() },
             Color32::from_rgba_premultiplied(90, 10, 10, 230));
-        p.text(dr.center(), egui::Align2::CENTER_CENTER, "x", FontId::proportional(10.0), RED);
-        if ui.interact(dr, egui::Id::new(("del", id)), egui::Sense::click()).clicked() {
-            del_clicked = true;
-        }
+        p.text(del_rect.center(), egui::Align2::CENTER_CENTER, "x",
+            FontId::proportional(10.0), RED);
     }
 
+    let del_clicked = del_resp.clicked();
     (resp.clicked() && !del_clicked, del_clicked)
 }
 
@@ -676,12 +688,12 @@ impl App {
                         .min_size(Vec2::new(140.0, 30.0))).clicked()
                     {
                         if let Some(id) = self.selected_video.clone() {
-                            if let Some(v) = self.videos.iter().find(|v| v.id == id) {
+                            let fps = self.videos.iter().find(|v| v.id == id).map(|v| v.fps).unwrap_or(15.0);
+                            if let Some((play_dir, count)) = self.prepare_play_dir(&id) {
                                 self.send(Cmd::Play {
-                                    frames_dir: frames_dir(&self.data_dir, &id).display().to_string(),
-                                    fps: v.fps, frame_count: v.frame_count, id: id.clone(),
+                                    frames_dir: play_dir.display().to_string(),
+                                    fps, frame_count: count, id: id.clone(),
                                 });
-                                self.status_msg = "Streaming".into();
                             }
                         }
                     }
