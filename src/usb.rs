@@ -12,13 +12,30 @@ const PAYLOAD: usize = PKT - 4;
 const CTRL: usize = 440;
 
 pub fn open() -> Option<DeviceHandle<rusb::GlobalContext>> {
-    let dev = rusb::open_device_with_vid_pid(VID, PID)?;
-    for iface in 0..=1u8 {
-        if dev.kernel_driver_active(iface).unwrap_or(false) {
-            dev.detach_kernel_driver(iface).ok()?;
+    let dev = match rusb::open_device_with_vid_pid(VID, PID) {
+        Some(d) => d,
+        None => {
+            eprintln!("[usb] device {:04x}:{:04x} not found", VID, PID);
+            return None;
         }
-        dev.claim_interface(iface).ok()?;
+    };
+    for iface in 0..=1u8 {
+        match dev.kernel_driver_active(iface) {
+            Ok(true) => {
+                if let Err(e) = dev.detach_kernel_driver(iface) {
+                    eprintln!("[usb] detach iface {}: {}", iface, e);
+                    return None;
+                }
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[usb] kernel_driver_active iface {}: {}", iface, e),
+        }
+        if let Err(e) = dev.claim_interface(iface) {
+            eprintln!("[usb] claim iface {}: {}", iface, e);
+            return None;
+        }
     }
+    eprintln!("[usb] device opened ok");
     Some(dev)
 }
 

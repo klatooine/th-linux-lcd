@@ -120,16 +120,20 @@ impl App {
     }
 
     fn ensure_daemon(&mut self) {
-        if self.daemon_up() { return }
-        // Remove stale socket if present
+        // Try connecting to an existing daemon first (socket may exist but
+        // daemon_connected is still false on first startup)
+        if std::os::unix::net::UnixStream::connect(socket_path()).is_ok() {
+            return; // socket is alive, a daemon is already running
+        }
+        // Socket not reachable — remove stale file if present and spawn
         let _ = std::fs::remove_file(socket_path());
         let exe = std::env::current_exe().unwrap_or_default();
         match std::process::Command::new(exe).arg("--daemon").spawn() {
             Ok(_) => {
-                // Wait up to 1s for socket to appear
-                for _ in 0..10 {
+                // Wait up to 2s for socket to appear
+                for _ in 0..20 {
                     std::thread::sleep(Duration::from_millis(100));
-                    if self.daemon_up() { break }
+                    if std::os::unix::net::UnixStream::connect(socket_path()).is_ok() { break }
                 }
                 self.status_msg = "Daemon started".into();
             }
@@ -544,6 +548,16 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             if ui.button(RichText::new("START").color(TEXT_DIM).monospace().size(10.0)).clicked() {
                                 self.ensure_daemon();
+                            }
+                        } else if !self.daemon_status.device_found {
+                            ui.add_space(6.0);
+                            if ui.add(egui::Button::new(
+                                RichText::new("RETRY").color(Color32::from_rgb(180,70,0)).monospace().size(10.0))
+                                .fill(Color32::from_rgb(28, 14, 0))
+                                .stroke(Stroke::new(1.0, Color32::from_rgb(120, 50, 0)))
+                                .min_size(Vec2::new(44.0, 22.0))).clicked()
+                            {
+                                self.last_status_poll = Instant::now() - Duration::from_secs(10);
                             }
                         }
                     });
