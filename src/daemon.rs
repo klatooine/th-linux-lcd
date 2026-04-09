@@ -36,6 +36,7 @@ pub enum UsbCmd {
     ScreenOn,
     ScreenOff,
     UploadStandby { path: String, done_tx: std::sync::mpsc::SyncSender<Result<(), String>> },
+    UploadBoot    { path: String, done_tx: std::sync::mpsc::SyncSender<Result<(), String>> },
     Quit,
 }
 
@@ -102,6 +103,19 @@ fn usb_thread(
                             fs::read(&path)
                                 .map_err(|e| e.to_string())
                                 .and_then(|data| usb::upload_standby(dev, &data))
+                        } else {
+                            Err("Device not found".into())
+                        };
+                        let _ = done_tx.send(result);
+                        state.playing = was_playing;
+                    }
+                    UsbCmd::UploadBoot { path, done_tx } => {
+                        let was_playing = state.playing;
+                        state.playing = false;
+                        let result = if let Some(ref dev) = device {
+                            fs::read(&path)
+                                .map_err(|e| e.to_string())
+                                .and_then(|data| usb::upload_boot_animation(dev, &data))
                         } else {
                             Err("Device not found".into())
                         };
@@ -197,6 +211,15 @@ fn handle_conn(
                     Ok(Ok(())) => Resp::Ok,
                     Ok(Err(e)) => Resp::Err { msg: e },
                     Err(_) => Resp::Err { msg: "Upload timed out".into() },
+                }
+            }
+            Cmd::UploadBoot { path } => {
+                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+                let _ = usb_tx.send(UsbCmd::UploadBoot { path, done_tx });
+                match done_rx.recv_timeout(Duration::from_secs(120)) {
+                    Ok(Ok(())) => Resp::Ok,
+                    Ok(Err(e)) => Resp::Err { msg: e },
+                    Err(_) => Resp::Err { msg: "Boot upload timed out".into() },
                 }
             }
             Cmd::Status => {

@@ -140,7 +140,9 @@ pub fn boot_dir(data: &PathBuf) -> PathBuf {
 pub fn build_boot_container(frames: &[Vec<u8>], fps: f32) -> Vec<u8> {
     let n = frames.len() as u8;
     let tbl_size = (n as u32) * 16;
-    let timing = (1000.0 / fps.max(1.0)).round() as u8;
+    // Firmware rejects timing < 80ms (> 12.5fps) — cap playback at 12.5fps
+    let fps_capped = fps.min(12.5).max(1.0);
+    let timing = (1000.0 / fps_capped).round() as u8;
 
     // Frame offsets — each frame entry is: 8-byte filename sub-header + JPEG bytes
     const TBL_OFF: u32 = 32;

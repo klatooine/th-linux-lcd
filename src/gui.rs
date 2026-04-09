@@ -1,7 +1,7 @@
 use crate::shared::{
-    daemon_cmd, data_dir, decode_thumbnail, frames_dir, load_standby, load_videos,
-    make_thumbnail, save_standby, save_videos, socket_path, standby_dir, Cmd, DaemonStatus,
-    Resp, StandbyImage, Video,
+    boot_dir, build_boot_container, daemon_cmd, data_dir, decode_thumbnail, frames_dir,
+    load_boot, load_standby, load_videos, make_thumbnail, save_boot, save_standby, save_videos,
+    socket_path, standby_dir, BootAnim, Cmd, DaemonStatus, Resp, StandbyImage, Video,
 };
 use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke, TextureHandle, TextureOptions, Vec2};
@@ -64,7 +64,7 @@ fn setup_theme(ctx: &egui::Context) {
 // ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Animation, Standby }
+enum Tab { Animation, Standby, Boot }
 
 struct BgTask {
     rx: Receiver<Result<(), String>>,
@@ -75,9 +75,11 @@ pub struct App {
     data_dir: PathBuf,
     videos: Vec<Video>,
     standby: Vec<StandbyImage>,
+    boot_anims: Vec<BootAnim>,
     tab: Tab,
     selected_video: Option<String>,
     selected_standby: Option<String>,
+    selected_boot: Option<String>,
     daemon_status: DaemonStatus,
     status_msg: String,
     preview_texture: Option<TextureHandle>,
@@ -95,15 +97,18 @@ impl App {
         let data = data_dir();
         let videos = load_videos(&data);
         let standby = load_standby(&data);
+        let boot_anims = load_boot(&data);
         let selected_video = videos.first().map(|v| v.id.clone());
 
         let mut app = App {
             data_dir: data,
             videos,
             standby,
+            boot_anims,
             tab: Tab::Animation,
             selected_video,
             selected_standby: None,
+            selected_boot: None,
             daemon_status: DaemonStatus::default(),
             status_msg: String::new(),
             preview_texture: None,
@@ -187,6 +192,16 @@ impl App {
                     [rgba.width() as usize, rgba.height() as usize], &rgba);
                 self.preview_texture = Some(ctx.load_texture("preview_sb", ci, TextureOptions::LINEAR));
             }
+        }
+    }
+
+    fn load_boot_preview(&mut self, ctx: &egui::Context) {
+        let Some(ref id) = self.selected_boot.clone() else { return };
+        let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) else { return };
+        if anim.thumbnail.is_empty() { return }
+        if let Some((pixels, size)) = decode_thumbnail(&anim.thumbnail) {
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            self.preview_texture = Some(ctx.load_texture("preview_boot", ci, TextureOptions::LINEAR));
         }
     }
 
@@ -398,6 +413,117 @@ while q>=20:
             Err(e) => self.status_msg = format!("Error: {}", e),
         }
     }
+
+    fn add_boot(&mut self) {
+        if self.bg_task.is_some() { return }
+        let out = std::process::Command::new("zenity")
+            .args(["--file-selection", "--title=Select GIF for Boot Animation",
+                   "--file-filter=GIF | *.gif", "--modal"])
+            .output();
+        let Ok(out) = out else { return };
+        if !out.status.success() { return }
+        let src = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+        if src.extension().map_or(true, |e| e != "gif") { return }
+
+        let name = src.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let boot_d = boot_dir(&self.data_dir);
+        let out_path = boot_d.join(format!("{}.bootanim", id));
+        let src_s = src.display().to_string();
+        let out_s = out_path.display().to_string();
+
+        self.status_msg = "Importing boot animation...".into();
+        let (tx, rx) = channel::<Result<(usize, f32, String), String>>();
+
+        // Temp dir for extracted frames
+        let tmp_dir = boot_d.join(format!("{}_frames", id));
+        let tmp_s = tmp_dir.display().to_string();
+
+        std::thread::spawn(move || {
+            // Extract frames via Pillow (up to 40, quality ~65 for ~30KB/frame)
+            let script = format!(r#"
+from PIL import Image
+import io, os, json
+src={src:?}; tmp={tmp:?}
+os.makedirs(tmp, exist_ok=True)
+img=Image.open(src); frames=[]
+try:
+    while True:
+        frames.append(img.copy().convert('RGB')); img.seek(img.tell()+1)
+except EOFError: pass
+n=min(len(frames),40); step=max(len(frames)//n,1); sel=frames[::step][:n]
+total_ms=getattr(img,'info',{{}}).get('duration',80)*len(frames)
+fps=min(max(1000.0*len(frames)/max(total_ms,1),5.0),20.0)
+jpeg_frames=[]
+for i,frame in enumerate(sel):
+    r=frame.resize((480,480),Image.LANCZOS)
+    b=io.BytesIO(); r.save(b,'JPEG',quality=75,subsampling='4:2:0',dpi=(96,96))
+    jpeg_frames.append(b.getvalue())
+    open(os.path.join(tmp,f'f{{i:05}}.jpg'),'wb').write(b.getvalue())
+print(json.dumps({{"n":len(sel),"fps":fps}}))
+"#, src = src_s, tmp = tmp_s);
+            let r = std::process::Command::new("python3").args(["-c", &script]).output();
+            match r {
+                Ok(o) if o.status.success() => {
+                    let v: serde_json::Value = serde_json::from_str(
+                        String::from_utf8_lossy(&o.stdout).trim()).unwrap_or_default();
+                    let n   = v["n"].as_u64().unwrap_or(1) as usize;
+                    let fps = v["fps"].as_f64().unwrap_or(12.5) as f32;
+                    // Build container
+                    let mut jpeg_frames: Vec<Vec<u8>> = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let p = format!("{}/f{:05}.jpg", tmp_s, i);
+                        match std::fs::read(&p) {
+                            Ok(d) => jpeg_frames.push(d),
+                            Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
+                        }
+                    }
+                    let container = build_boot_container(&jpeg_frames, fps);
+                    if let Err(e) = std::fs::write(&out_s, &container) {
+                        let _ = tx.send(Err(e.to_string())); return;
+                    }
+                    // Cleanup temp frames
+                    let _ = std::fs::remove_dir_all(&tmp_s);
+                    let _ = tx.send(Ok((n, fps, out_s)));
+                }
+                Ok(o) => { let _ = tx.send(Err(String::from_utf8_lossy(&o.stderr).into())); }
+                Err(e) => { let _ = tx.send(Err(e.to_string())); }
+            }
+        });
+
+        match rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(Ok((n, fps, path))) => {
+                // Use first frame for thumbnail — read directly from container
+                let thumb = if let Ok(data) = std::fs::read(&path) {
+                    // First frame JPEG starts at offset 32 + n*16 + 8 (after sub-header)
+                    let tbl_size = (n as u32) * 16;
+                    let frame0_off = (32 + tbl_size + 8) as usize;
+                    if data.len() > frame0_off {
+                        use base64::Engine;
+                        let frame_size = u32::from_le_bytes(
+                            data[32+4..32+8].try_into().unwrap_or([0;4])) as usize;
+                        let end = (frame0_off + frame_size).min(data.len());
+                        if let Ok(img) = image::load_from_memory(&data[frame0_off..end]) {
+                            let small = img.resize(96, 96, image::imageops::FilterType::Lanczos3);
+                            let mut buf = Vec::new();
+                            small.write_to(&mut std::io::Cursor::new(&mut buf),
+                                image::ImageFormat::Jpeg).ok();
+                            base64::engine::general_purpose::STANDARD.encode(&buf)
+                        } else { String::new() }
+                    } else { String::new() }
+                } else { String::new() };
+
+                let anim = BootAnim { id: id.clone(), name, path, frame_count: n, fps, thumbnail: thumb };
+                self.boot_anims.push(anim);
+                save_boot(&self.data_dir, &self.boot_anims);
+                self.selected_boot = Some(id);
+                self.preview_texture = None;
+                self.status_msg = format!("Boot animation: {} frames @ {:.0}fps", n, fps);
+            }
+            Ok(Err(e)) => self.status_msg = format!("Import failed: {}", e),
+            Err(_) => self.status_msg = "Timed out".into(),
+        }
+    }
 }
 
 // ── Circle image draw (mesh-based, no corner hacks) ───────────────────────────
@@ -501,6 +627,9 @@ impl eframe::App for App {
         if self.tab == Tab::Standby && self.preview_texture.is_none() {
             self.load_standby_preview(ctx);
         }
+        if self.tab == Tab::Boot && self.preview_texture.is_none() {
+            self.load_boot_preview(ctx);
+        }
 
         // ── Top bar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("topbar")
@@ -590,7 +719,7 @@ impl eframe::App for App {
                 .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 12.0, bottom: 12.0 }))
             .show(ctx, |ui| {
                 ui.add_space(4.0);
-                for (t, lbl) in [(Tab::Animation, "ANIMATION"), (Tab::Standby, "STANDBY")] {
+                for (t, lbl) in [(Tab::Animation, "ANIMATION"), (Tab::Standby, "STANDBY"), (Tab::Boot, "BOOT")] {
                     let active = self.tab == t;
                     let btn = egui::Button::new(
                         RichText::new(lbl)
@@ -616,6 +745,7 @@ impl eframe::App for App {
                 match self.tab {
                     Tab::Animation => self.ui_animation(ui, ctx),
                     Tab::Standby => self.ui_standby(ui, ctx),
+                    Tab::Boot => self.ui_boot(ui, ctx),
                 }
             });
     }
@@ -879,6 +1009,119 @@ impl App {
             self.thumb_cache.remove(&id);
             if self.selected_standby.as_deref() == Some(&id) {
                 self.selected_standby = None;
+                self.preview_texture = None;
+            }
+        }
+    }
+
+    fn ui_boot(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            let sz = 180.0f32;
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(sz), egui::Sense::hover());
+            let center = rect.center();
+            let r = sz / 2.0;
+            let p = ui.painter();
+            p.circle_filled(center, r, Color32::from_rgb(5, 5, 5));
+            if let Some(ref tex) = self.preview_texture {
+                draw_circle_image(p, center, r - 1.0, tex.id());
+            } else {
+                p.text(center, egui::Align2::CENTER_CENTER, "NO SIGNAL",
+                    FontId::monospace(10.0), TEXT_DIM);
+            }
+            p.circle_stroke(center, r - 1.0, Stroke::new(2.0, BORDER));
+
+            ui.add_space(16.0);
+
+            ui.vertical(|ui| {
+                ui.add_space(8.0);
+                if let Some(ref id) = self.selected_boot.clone() {
+                    if let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) {
+                        ui.label(RichText::new(&anim.name).color(GREEN).monospace().size(12.0));
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(format!("{} frames  {:.0} fps", anim.frame_count, anim.fps))
+                            .color(TEXT_DIM).monospace().size(10.0));
+                    }
+                } else {
+                    ui.label(RichText::new("no boot animation selected").color(TEXT_DIM).monospace().size(11.0));
+                }
+
+                ui.add_space(12.0);
+
+                let has_sel = self.selected_boot.is_some();
+                let busy = self.bg_task.is_some();
+                let enabled = has_sel && !busy;
+                let lbl = if busy { "UPLOADING..." } else { "UPLOAD TO LCD" };
+
+                if ui.add_enabled(enabled, egui::Button::new(
+                    RichText::new(lbl).color(if enabled { GREEN } else { TEXT_DIM }).monospace().size(12.0))
+                    .fill(if enabled { GREEN_DIM } else { BG_CARD })
+                    .stroke(Stroke::new(1.0, if enabled { GREEN_MID } else { BORDER }))
+                    .min_size(Vec2::new(140.0, 30.0))).clicked()
+                {
+                    if let Some(id) = &self.selected_boot.clone() {
+                        if let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) {
+                            let path = anim.path.clone();
+                            self.send_bg(Cmd::UploadBoot { path }, "Uploading boot...");
+                            self.status_msg = "Uploading boot animation...".into();
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.add_space(14.0);
+        ui.add(egui::Separator::default().horizontal());
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("BOOT ANIMATIONS").color(TEXT_DIM).monospace().size(10.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(RichText::new("+ ADD GIF").color(TEXT_DIM).monospace().size(10.0)).clicked() {
+                    self.add_boot();
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if self.boot_anims.is_empty() {
+            ui.label(RichText::new("No boot animations — import a GIF to get started").color(TEXT_DIM).monospace().size(11.0));
+            return;
+        }
+
+        let items: Vec<(String, String, String)> = self.boot_anims.iter()
+            .map(|a| (a.id.clone(), a.name.clone(), a.thumbnail.clone())).collect();
+        let card = 88.0;
+        let mut sel = None;
+        let mut del = None;
+
+        egui::ScrollArea::vertical().id_salt("boot_scroll").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.style_mut().spacing.item_spacing = Vec2::splat(5.0);
+                for (id, name, b64) in &items {
+                    let selected = self.selected_boot.as_deref() == Some(id);
+                    let tex = self.get_thumb(ctx, id, b64);
+                    let (clicked, deleted) = gallery_card(ui, id, name, tex, selected, card);
+                    if clicked { sel = Some(id.clone()); }
+                    if deleted { del = Some(id.clone()); }
+                }
+            });
+        });
+
+        if let Some(id) = sel {
+            if self.selected_boot.as_deref() != Some(&id) {
+                self.selected_boot = Some(id);
+                self.preview_texture = None;
+            }
+        }
+        if let Some(id) = del {
+            if let Some(anim) = self.boot_anims.iter().find(|a| a.id == id) {
+                let _ = std::fs::remove_file(&anim.path);
+            }
+            self.boot_anims.retain(|a| a.id != id);
+            save_boot(&self.data_dir, &self.boot_anims);
+            self.thumb_cache.remove(&id);
+            if self.selected_boot.as_deref() == Some(&id) {
+                self.selected_boot = None;
                 self.preview_texture = None;
             }
         }

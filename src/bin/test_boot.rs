@@ -85,11 +85,15 @@ try:
         img.seek(img.tell() + 1)
 except EOFError:
     pass
-n = min(len(frames), 40)
+TARGET = 40
+n = min(len(frames), TARGET)
 step = max(len(frames) // n, 1)
 sel = frames[::step][:n]
+# Pad to exactly TARGET frames by repeating the last frame
+while len(sel) < TARGET:
+    sel.append(sel[-1].copy())
 total_ms = getattr(img, 'info', {{}}).get('duration', 80) * len(frames)
-fps = min(max(1000.0 * len(frames) / max(total_ms, 1), 5.0), 20.0)
+fps = min(max(1000.0 * len(frames) / max(total_ms, 1), 5.0), 12.5)
 sizes = []
 for i, frame in enumerate(sel):
     r = frame.resize((480, 480), Image.LANCZOS)
@@ -327,8 +331,21 @@ fn upload(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8]) -> Result<(), St
         offset += this_chunk;
     }
 
-    // CMD 0x14 intentionally omitted — testing whether FINALIZE alone commits kind=1 to boot slot.
-    // (Hypothesis: CMD 0x14 may cancel/abort the upload rather than commit it.)
+    // CMD 0x14 — commit to flash (fire-and-forget; confirmed from pcap trace, no real ACK)
+    print!("    CMD 0x14 commit ... ");
+    std::io::stdout().flush().ok();
+    {
+        let mut p = vec![0u8; CTRL];
+        p[0] = 0x14; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80; p[4] = 0x62;
+        match dev.write_interrupt(EP_CTRL, &p, t2) {
+            Err(e) => println!("write failed: {e}"),
+            Ok(_) => {
+                let mut r = vec![0u8; CTRL];
+                let n = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500)).unwrap_or(0);
+                println!("done (ACK {n}B: {:02x} {:02x} {:02x} {:02x})", r[0], r[1], r[2], r[3]);
+            }
+        }
+    }
 
     // Poll CMD 0x82 every 2s for 30s — keep USB alive during flash write.
     println!("    waiting for flash write (~30s) ...");
