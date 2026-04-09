@@ -38,6 +38,7 @@ pub enum Cmd {
     ScreenOn,
     ScreenOff,
     UploadStandby { path: String },
+    UploadBoot { path: String },
     Status,
 }
 
@@ -103,6 +104,103 @@ pub fn load_standby(data: &PathBuf) -> Vec<StandbyImage> {
 
 pub fn save_standby(data: &PathBuf, images: &[StandbyImage]) {
     let _ = fs::write(data.join("standby.json"), serde_json::to_string_pretty(images).unwrap());
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootAnim {
+    pub id: String,
+    pub name: String,
+    pub path: String,        // path to .bootanim binary on disk
+    pub frame_count: usize,
+    pub fps: f32,
+    pub thumbnail: String,   // base64-encoded 96×96 JPEG of first frame
+}
+
+pub fn load_boot(data: &PathBuf) -> Vec<BootAnim> {
+    let p = data.join("boot.json");
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_boot(data: &PathBuf, anims: &[BootAnim]) {
+    let _ = fs::write(data.join("boot.json"), serde_json::to_string_pretty(anims).unwrap());
+}
+
+pub fn boot_dir(data: &PathBuf) -> PathBuf {
+    let d = data.join("boot");
+    fs::create_dir_all(&d).ok();
+    d
+}
+
+/// Build the Update_Boot_GIF binary container from a list of 480×480 JPEG frames.
+/// `fps` controls the playback speed (timing byte = round(1000/fps)).
+/// Returns the raw bytes to be written to disk and uploaded.
+pub fn build_boot_container(frames: &[Vec<u8>], fps: f32) -> Vec<u8> {
+    let n = frames.len() as u8;
+    let tbl_size = (n as u32) * 16;
+    let timing = (1000.0 / fps.max(1.0)).round() as u8;
+
+    // Frame offsets — each frame entry is: 8-byte filename sub-header + JPEG bytes
+    const TBL_OFF: u32 = 32;
+    const SUB_HDR: u32 = 8;
+    let data_start = TBL_OFF + tbl_size;
+    let mut offsets: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut cur = data_start;
+    for frame in frames {
+        offsets.push(cur);
+        cur += SUB_HDR + frame.len() as u32;
+    }
+    // cur = offset where trailer starts. Full container = cur + 16 (trailer).
+    // content_size = full - outer_header(16) = cur. Checksum uses full container size.
+    let content_size = cur;
+    let full_size    = cur + 16;
+    let checksum = (-(full_size as i64 + n as i64 * 17)) as i32;
+
+    let mut buf = Vec::with_capacity(full_size as usize);
+
+    // Outer header (16 bytes)
+    buf.extend_from_slice(&checksum.to_le_bytes());
+    buf.extend_from_slice(&content_size.to_le_bytes());
+    buf.extend_from_slice(&tbl_size.to_le_bytes());
+    buf.push(0x10);
+    buf.push(0x00);
+    buf.push(n);
+    buf.push(timing);
+
+    // Magic (16 bytes, null-padded)
+    let mut magic = [0u8; 16];
+    magic[..15].copy_from_slice(b"Update_Boot_GIF");
+    buf.extend_from_slice(&magic);
+
+    // Frame table — flags[i] = -(offset[i] + 8 + frame_size[i]) as int32
+    // This encodes the negated start of the next frame (confirmed from traces)
+    for (&off, frame) in offsets.iter().zip(frames.iter()) {
+        let flags = (-(off as i64 + 8 + frame.len() as i64)) as i32;
+        buf.extend_from_slice(&flags.to_le_bytes());
+        buf.extend_from_slice(&off.to_le_bytes());
+        buf.extend_from_slice(&(frame.len() as u32).to_le_bytes()); // JPEG size, excl. sub-header
+        buf.extend_from_slice(&0x40000008u32.to_le_bytes()); // constant observed in traces
+    }
+
+    // Frame data
+    for (i, frame) in frames.iter().enumerate() {
+        // 8-byte null-padded filename: "NNN.jpg\0"
+        let name = format!("{:03}.jpg", i);
+        let mut sub = [0u8; 8];
+        let nb = name.as_bytes();
+        sub[..nb.len().min(7)].copy_from_slice(&nb[..nb.len().min(7)]);
+        buf.extend_from_slice(&sub);
+        buf.extend_from_slice(frame);
+    }
+
+    // 16-byte trailer required by firmware: 15 zero bytes + 0x10
+    // Observed in both Windows trace sessions; absent → device rejects CMD 0x14
+    buf.extend_from_slice(&[0u8; 15]);
+    buf.push(0x10);
+
+    buf
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

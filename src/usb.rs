@@ -6,7 +6,7 @@ const PID: u16 = 0x233c;
 const EP_OUT: u8 = 0x03;   // interface 1 — animation frames
 const EP_IN: u8 = 0x84;    // interface 1 — drain after each frame
 const EP_CTRL: u8 = 0x01;  // interface 0 — control commands
-const EP_CTRL_IN: u8 = 0x82; // interface 0 — ACK responses
+const EP_CTRL_IN: u8 = 0x82; // interface 0 — ACK responses (440-byte, one per completed command)
 const PKT: usize = 1024;
 const PAYLOAD: usize = PKT - 4;
 const CTRL: usize = 440;
@@ -71,11 +71,19 @@ pub fn screen_off(dev: &DeviceHandle<rusb::GlobalContext>) {
     let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
 }
 
+pub fn upload_boot_animation(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8]) -> Result<(), String> {
+    upload_impl(dev, data, 1)
+}
+
 pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> Result<(), String> {
+    upload_impl(dev, jpeg, 0)
+}
+
+fn upload_impl(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8], kind: u32) -> Result<(), String> {
     const CHUNK: usize = 10240;
     const HDR_DATA: usize = 424;
     const PKT_DATA: usize = 436;
-    let sz = jpeg.len();
+    let sz = data.len();
 
     // Pre-finalize
     let mut p = vec![0u8; CTRL];
@@ -84,9 +92,10 @@ pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> R
     let mut r = vec![0u8; CTRL];
     let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(200));
 
-    // INIT
+    // INIT — kind=0 for standby, kind=1 for boot animation
     let mut p = vec![0u8; CTRL];
     p[0] = 0x0a; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
+    p[4..8].copy_from_slice(&kind.to_le_bytes());
     p[8..12].copy_from_slice(&(sz as u32).to_le_bytes());
     dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
     let mut r = vec![0u8; CTRL];
@@ -108,7 +117,7 @@ pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> R
         p[4..8].copy_from_slice(&(offset as u32).to_le_bytes());
         p[8..12].copy_from_slice(&(this_chunk as u32).to_le_bytes());
         p[12..16].copy_from_slice(&progress.to_le_bytes());
-        p[16..16 + copy_len].copy_from_slice(&jpeg[offset..offset + copy_len]);
+        p[16..16 + copy_len].copy_from_slice(&data[offset..offset + copy_len]);
         dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
 
         let mut data_off = offset + copy_len;
@@ -118,7 +127,7 @@ pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> R
             let n = PKT_DATA.min(remaining);
             let mut p = vec![0u8; CTRL];
             p[0] = 0x0b; p[1] = seq; p[2] = 0x00; p[3] = 0x00;
-            p[4..4 + n].copy_from_slice(&jpeg[data_off..data_off + n]);
+            p[4..4 + n].copy_from_slice(&data[data_off..data_off + n]);
             dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
             data_off += n;
             remaining -= n;
@@ -128,6 +137,30 @@ pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> R
         let mut r = vec![0u8; CTRL];
         let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
         offset += this_chunk;
+    }
+
+    // Commit (boot animation only) — CMD 0x14 triggers device to burn uploaded data to flash.
+    // Not used for standby uploads. Byte[4] = 0x62 matches Windows app traces.
+    // After this, the device takes ~17s to write flash; poll CMD 0x82 until not busy.
+    if kind == 1 {
+        let mut p = vec![0u8; CTRL];
+        p[0] = 0x14; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80; p[4] = 0x62;
+        dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+        let mut r = vec![0u8; CTRL];
+        let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
+
+        // Poll CMD 0x82 every 2s for up to 30s waiting for flash to complete.
+        // Device reports busy with 0xff in ACK bytes[2:3] or bytes[4:5] during write.
+        // We can't reliably read EP 0x81 status, so we just keep the USB session alive
+        // and give the device enough time to finish.
+        for _ in 0..15 {
+            std::thread::sleep(Duration::from_secs(2));
+            let mut p = vec![0u8; CTRL];
+            p[0] = 0x82; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
+            let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
+            let mut r = vec![0u8; CTRL];
+            let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
+        }
     }
 
     // Finalize
