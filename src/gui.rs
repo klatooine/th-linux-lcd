@@ -452,8 +452,9 @@ try:
         frames.append(img.copy().convert('RGB')); img.seek(img.tell()+1)
 except EOFError: pass
 n=min(len(frames),40); step=max(len(frames)//n,1); sel=frames[::step][:n]
+while len(sel)<40: sel.append(sel[-1].copy())
 total_ms=getattr(img,'info',{{}}).get('duration',80)*len(frames)
-fps=min(max(1000.0*len(frames)/max(total_ms,1),5.0),20.0)
+fps=min(max(1000.0*len(frames)/max(total_ms,1),5.0),12.5)
 jpeg_frames=[]
 for i,frame in enumerate(sel):
     r=frame.resize((480,480),Image.LANCZOS)
