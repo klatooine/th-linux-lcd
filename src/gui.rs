@@ -414,6 +414,69 @@ while q>=20:
         }
     }
 
+    fn build_boot_container_from_gif(src_gif: &str, rotation: i32, out_path: &str) -> Result<(usize, f32), String> {
+        let tmp_dir = format!("{}.frames", out_path);
+        let script = format!(r#"
+from PIL import Image
+import io, os, json
+src={src:?}; tmp={tmp:?}; rotation={rot}
+os.makedirs(tmp, exist_ok=True)
+img=Image.open(src); frames=[]
+try:
+    while True:
+        frames.append(img.copy().convert('RGB')); img.seek(img.tell()+1)
+except EOFError: pass
+n=min(len(frames),40); step=max(len(frames)//n,1); sel=frames[::step][:n]
+while len(sel)<40: sel.append(sel[-1].copy())
+durations=[f.info.get('duration',80) if hasattr(f,'info') else 80 for f in frames]
+total_ms=sum(durations) if durations else 80*len(frames)
+fps=min(max(1000.0*len(frames)/max(total_ms,1),5.0),12.5)
+for i,frame in enumerate(sel):
+    r=frame.resize((480,480),Image.LANCZOS)
+    if rotation: r=r.rotate(-rotation,expand=False)
+    b=io.BytesIO(); r.save(b,'JPEG',quality=75,subsampling=2,dpi=(96,96))
+    open(os.path.join(tmp,f'f{{i:05}}.jpg'),'wb').write(b.getvalue())
+print(json.dumps({{"n":len(sel),"fps":fps}}))
+"#, src = src_gif, tmp = &tmp_dir, rot = rotation);
+
+        let o = std::process::Command::new("python3").args(["-c", &script]).output()
+            .map_err(|e| e.to_string())?;
+        if !o.status.success() {
+            return Err(String::from_utf8_lossy(&o.stderr).into());
+        }
+        let v: serde_json::Value = serde_json::from_str(
+            String::from_utf8_lossy(&o.stdout).trim()).unwrap_or_default();
+        let n   = v["n"].as_u64().unwrap_or(1) as usize;
+        let fps = v["fps"].as_f64().unwrap_or(12.5) as f32;
+
+        let mut jpeg_frames: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let p = format!("{}/f{:05}.jpg", tmp_dir, i);
+            jpeg_frames.push(std::fs::read(&p).map_err(|e| e.to_string())?);
+        }
+        let container = build_boot_container(&jpeg_frames, fps);
+        std::fs::write(out_path, &container).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok((n, fps))
+    }
+
+    fn thumb_from_bootanim(path: &str, n: usize) -> String {
+        use base64::Engine;
+        let Ok(data) = std::fs::read(path) else { return String::new() };
+        // Frame[0] size is at offset 32+8..32+12 in the frame table entry
+        let frame_size = u32::from_le_bytes(data[32+8..32+12].try_into().unwrap_or([0;4])) as usize;
+        // Frame[0] JPEG starts at: 32 (header+magic) + n*16 (table) + 8 (sub-header)
+        let tbl_size = n * 16;
+        let frame0_off = 32 + tbl_size + 8;
+        let end = (frame0_off + frame_size).min(data.len());
+        if data.len() <= frame0_off || frame_size == 0 { return String::new() }
+        let Ok(img) = image::load_from_memory(&data[frame0_off..end]) else { return String::new() };
+        let small = img.resize(96, 96, image::imageops::FilterType::Lanczos3);
+        let mut buf = Vec::new();
+        small.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).ok();
+        base64::engine::general_purpose::STANDARD.encode(&buf)
+    }
+
     fn add_boot(&mut self) {
         if self.bg_task.is_some() { return }
         let out = std::process::Command::new("zenity")
@@ -433,88 +496,20 @@ while q>=20:
         let out_s = out_path.display().to_string();
 
         self.status_msg = "Importing boot animation...".into();
-        let (tx, rx) = channel::<Result<(usize, f32, String), String>>();
-
-        // Temp dir for extracted frames
-        let tmp_dir = boot_d.join(format!("{}_frames", id));
-        let tmp_s = tmp_dir.display().to_string();
+        let (tx, rx) = channel::<Result<(usize, f32), String>>();
 
         std::thread::spawn(move || {
-            // Extract frames via Pillow (up to 40, quality ~65 for ~30KB/frame)
-            let script = format!(r#"
-from PIL import Image
-import io, os, json
-src={src:?}; tmp={tmp:?}
-os.makedirs(tmp, exist_ok=True)
-img=Image.open(src); frames=[]
-try:
-    while True:
-        frames.append(img.copy().convert('RGB')); img.seek(img.tell()+1)
-except EOFError: pass
-n=min(len(frames),40); step=max(len(frames)//n,1); sel=frames[::step][:n]
-while len(sel)<40: sel.append(sel[-1].copy())
-total_ms=getattr(img,'info',{{}}).get('duration',80)*len(frames)
-fps=min(max(1000.0*len(frames)/max(total_ms,1),5.0),12.5)
-jpeg_frames=[]
-for i,frame in enumerate(sel):
-    r=frame.resize((480,480),Image.LANCZOS)
-    b=io.BytesIO(); r.save(b,'JPEG',quality=75,subsampling='4:2:0',dpi=(96,96))
-    jpeg_frames.append(b.getvalue())
-    open(os.path.join(tmp,f'f{{i:05}}.jpg'),'wb').write(b.getvalue())
-print(json.dumps({{"n":len(sel),"fps":fps}}))
-"#, src = src_s, tmp = tmp_s);
-            let r = std::process::Command::new("python3").args(["-c", &script]).output();
-            match r {
-                Ok(o) if o.status.success() => {
-                    let v: serde_json::Value = serde_json::from_str(
-                        String::from_utf8_lossy(&o.stdout).trim()).unwrap_or_default();
-                    let n   = v["n"].as_u64().unwrap_or(1) as usize;
-                    let fps = v["fps"].as_f64().unwrap_or(12.5) as f32;
-                    // Build container
-                    let mut jpeg_frames: Vec<Vec<u8>> = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let p = format!("{}/f{:05}.jpg", tmp_s, i);
-                        match std::fs::read(&p) {
-                            Ok(d) => jpeg_frames.push(d),
-                            Err(e) => { let _ = tx.send(Err(e.to_string())); return; }
-                        }
-                    }
-                    let container = build_boot_container(&jpeg_frames, fps);
-                    if let Err(e) = std::fs::write(&out_s, &container) {
-                        let _ = tx.send(Err(e.to_string())); return;
-                    }
-                    // Cleanup temp frames
-                    let _ = std::fs::remove_dir_all(&tmp_s);
-                    let _ = tx.send(Ok((n, fps, out_s)));
-                }
-                Ok(o) => { let _ = tx.send(Err(String::from_utf8_lossy(&o.stderr).into())); }
-                Err(e) => { let _ = tx.send(Err(e.to_string())); }
-            }
+            let _ = tx.send(Self::build_boot_container_from_gif(&src_s, 0, &out_s));
         });
 
         match rx.recv_timeout(Duration::from_secs(120)) {
-            Ok(Ok((n, fps, path))) => {
-                // Use first frame for thumbnail — read directly from container
-                let thumb = if let Ok(data) = std::fs::read(&path) {
-                    // First frame JPEG starts at offset 32 + n*16 + 8 (after sub-header)
-                    let tbl_size = (n as u32) * 16;
-                    let frame0_off = (32 + tbl_size + 8) as usize;
-                    if data.len() > frame0_off {
-                        use base64::Engine;
-                        let frame_size = u32::from_le_bytes(
-                            data[32+4..32+8].try_into().unwrap_or([0;4])) as usize;
-                        let end = (frame0_off + frame_size).min(data.len());
-                        if let Ok(img) = image::load_from_memory(&data[frame0_off..end]) {
-                            let small = img.resize(96, 96, image::imageops::FilterType::Lanczos3);
-                            let mut buf = Vec::new();
-                            small.write_to(&mut std::io::Cursor::new(&mut buf),
-                                image::ImageFormat::Jpeg).ok();
-                            base64::engine::general_purpose::STANDARD.encode(&buf)
-                        } else { String::new() }
-                    } else { String::new() }
-                } else { String::new() };
-
-                let anim = BootAnim { id: id.clone(), name, path, frame_count: n, fps, thumbnail: thumb };
+            Ok(Ok((n, fps))) => {
+                let thumb = Self::thumb_from_bootanim(&out_path.display().to_string(), n);
+                let anim = BootAnim {
+                    id: id.clone(), name, path: out_path.display().to_string(),
+                    source_gif: src.display().to_string(),
+                    frame_count: n, fps, rotation: 0, thumbnail: thumb,
+                };
                 self.boot_anims.push(anim);
                 save_boot(&self.data_dir, &self.boot_anims);
                 self.selected_boot = Some(id);
@@ -523,6 +518,46 @@ print(json.dumps({{"n":len(sel),"fps":fps}}))
             }
             Ok(Err(e)) => self.status_msg = format!("Import failed: {}", e),
             Err(_) => self.status_msg = "Timed out".into(),
+        }
+    }
+
+    fn rotate_boot(&mut self, id: &str, delta: i32) {
+        let Some(anim) = self.boot_anims.iter_mut().find(|a| a.id == id) else { return };
+        anim.rotation = (anim.rotation + delta).rem_euclid(360);
+        let src = anim.source_gif.clone();
+        let rotation = anim.rotation;
+        let path = anim.path.clone();
+        let n_orig = anim.frame_count;
+
+        self.status_msg = format!("Re-encoding at {}°...", rotation);
+        let (tx, rx) = channel::<Result<(usize, f32), String>>();
+        let path2 = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::build_boot_container_from_gif(&src, rotation, &path2));
+        });
+
+        match rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(Ok((n, fps))) => {
+                let thumb = Self::thumb_from_bootanim(&path, n);
+                if let Some(anim) = self.boot_anims.iter_mut().find(|a| a.id == id) {
+                    anim.frame_count = n;
+                    anim.fps = fps;
+                    anim.thumbnail = thumb;
+                }
+                save_boot(&self.data_dir, &self.boot_anims);
+                self.thumb_cache.remove(id);
+                self.preview_texture = None;
+                self.status_msg = format!("Rotated to {}°", rotation);
+            }
+            Ok(Err(e)) => {
+                // Revert rotation on failure
+                if let Some(anim) = self.boot_anims.iter_mut().find(|a| a.id == id) {
+                    anim.rotation = (anim.rotation - delta).rem_euclid(360);
+                    anim.frame_count = n_orig;
+                }
+                self.status_msg = format!("Rotation failed: {}", e);
+            }
+            Err(_) => self.status_msg = "Rotation timed out".into(),
         }
     }
 }
@@ -1065,6 +1100,33 @@ impl App {
                             self.send_bg(Cmd::UploadBoot { path }, "Uploading boot...");
                             self.status_msg = "Uploading boot animation...".into();
                         }
+                    }
+                }
+
+                ui.add_space(8.0);
+
+                let rot_enabled = has_sel && !busy;
+                let rot_lbl = if let Some(ref id) = self.selected_boot {
+                    self.boot_anims.iter().find(|a| a.id == *id)
+                        .map(|a| format!("{}°", a.rotation)).unwrap_or_default()
+                } else { String::new() };
+                if !rot_lbl.is_empty() {
+                    ui.label(RichText::new(&rot_lbl).color(TEXT_DIM).monospace().size(11.0));
+                }
+                if ui.add_enabled(rot_enabled, egui::Button::new(
+                    RichText::new("↻ 90°").color(TEXT_DIM).monospace().size(11.0))
+                    .min_size(Vec2::new(55.0, 26.0))).clicked()
+                {
+                    if let Some(id) = self.selected_boot.clone() {
+                        self.rotate_boot(&id, 90);
+                    }
+                }
+                if ui.add_enabled(rot_enabled, egui::Button::new(
+                    RichText::new("↺ 90°").color(TEXT_DIM).monospace().size(11.0))
+                    .min_size(Vec2::new(55.0, 26.0))).clicked()
+                {
+                    if let Some(id) = self.selected_boot.clone() {
+                        self.rotate_boot(&id, -90);
                     }
                 }
             });

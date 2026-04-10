@@ -111,8 +111,10 @@ pub struct BootAnim {
     pub id: String,
     pub name: String,
     pub path: String,        // path to .bootanim binary on disk
+    pub source_gif: String,  // original GIF path (for re-encoding with rotation)
     pub frame_count: usize,
     pub fps: f32,
+    pub rotation: i32,       // 0, 90, 180, 270
     pub thumbnail: String,   // base64-encoded 96×96 JPEG of first frame
 }
 

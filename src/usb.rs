@@ -149,18 +149,8 @@ fn upload_impl(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8], kind: u32) 
         let mut r = vec![0u8; CTRL];
         let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
 
-        // Poll CMD 0x82 every 2s for up to 30s waiting for flash to complete.
-        // Device reports busy with 0xff in ACK bytes[2:3] or bytes[4:5] during write.
-        // We can't reliably read EP 0x81 status, so we just keep the USB session alive
-        // and give the device enough time to finish.
-        for _ in 0..15 {
-            std::thread::sleep(Duration::from_secs(2));
-            let mut p = vec![0u8; CTRL];
-            p[0] = 0x82; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
-            let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
-            let mut r = vec![0u8; CTRL];
-            let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
-        }
+        // No polling needed — Windows app traces show CMD 0x14 → FINALIZE immediately.
+        // All polls in testing returned 82 01 00 80 with no busy indication.
     }
 
     // Finalize
