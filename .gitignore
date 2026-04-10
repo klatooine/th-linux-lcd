@@ -1,1 +1,14 @@
 /target
+
+# Claude Code local config
+.claude/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

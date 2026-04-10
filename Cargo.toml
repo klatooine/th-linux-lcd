@@ -2,7 +2,11 @@
 name = "th-linux-lcd"
 version = "0.1.0"
 edition = "2021"
-description = "Thermaltake TH420V2 Ultra LCD controller for Linux"
+description = "Native Linux controller for the Thermaltake TH420V2 Ultra LCD display"
+repository = "https://github.com/klatooine/th-linux-lcd"
+license = "MIT"
+keywords = ["thermaltake", "lcd", "usb", "egui"]
+categories = ["hardware-support", "gui"]
 
 [dependencies]
 eframe = { version = "0.29", features = ["glow"] }
