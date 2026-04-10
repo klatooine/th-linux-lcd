@@ -1,5 +1,13 @@
 # th-linux-lcd
 
+> [!WARNING]
+> **Use at your own risk.**
+> This is homemade, unofficial software — not affiliated with or endorsed by Thermaltake.
+> It writes directly to device flash memory. There is **no guarantee** it will work on your hardware,
+> and it could potentially brick your LCD screen or damage its firmware.
+> It has been tested on a single device. No warranty, no support, no liability.
+> **You accept full responsibility for any damage caused.**
+
 Native Linux controller for the **Thermaltake TH420V2 Ultra** LCD display (USB `264a:233c`).
 
 Replaces the official Windows-only software with a lightweight Rust desktop application (~3 MB binary, ~150 ms startup). Protocol reverse-engineered from USB traces of the Windows app.
