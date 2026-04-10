@@ -32,33 +32,33 @@ Replaces the official Windows-only software with a lightweight Rust desktop appl
 
 ## Installation
 
-### Arch Linux (AUR)
-
-```bash
-yay -S th-linux-lcd
-```
-
-### From source
-
 ```bash
 git clone https://github.com/klatooine/th-linux-lcd.git
 cd th-linux-lcd
-cargo build --release
 bash install.sh
 ```
 
-`install.sh` places the binary in `~/.local/bin/` and installs the systemd user service.
+The installer handles everything:
 
-### USB permissions (non-root)
+- Installs system dependencies (`libusb`, `python-pillow`, `zenity`) via your distro's package manager (pacman / apt / dnf / zypper)
+- Builds the release binary with `cargo`
+- Installs the binary to `~/.local/bin/`
+- Installs and enables the systemd user service
+- Installs the desktop entry
+- Installs the udev rule for non-root USB access and adds your user to `plugdev`
 
-Copy the udev rule so you can access the device without `sudo`:
+> **After install:** log out and back in for the `plugdev` group membership to take effect, then run `th-linux-lcd`.
 
-```bash
-sudo cp pkg/99-thermaltake-lcd.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-sudo usermod -aG plugdev $USER
-# log out and back in
-```
+### Manual dependency install
+
+If you prefer to manage dependencies yourself:
+
+| Dependency | Arch | Debian/Ubuntu | Fedora |
+|-----------|------|---------------|--------|
+| libusb | `libusb` | `libusb-1.0-0` | `libusbx` |
+| Pillow | `python-pillow` | `python3-pil` | `python3-pillow` |
+| zenity (optional) | `zenity` | `zenity` | `zenity` |
+| Rust toolchain | `rust` | `cargo rustc` | `cargo rust` |
 
 ---
 
