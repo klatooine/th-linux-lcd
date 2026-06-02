@@ -130,6 +130,25 @@ pub fn save_boot(data: &PathBuf, anims: &[BootAnim]) {
     let _ = fs::write(data.join("boot.json"), serde_json::to_string_pretty(anims).unwrap());
 }
 
+// ── Autoplay persistence ──────────────────────────────────────────────────────
+
+/// Returns the video ID that should auto-play on daemon start, if any.
+pub fn load_autoplay(data: &PathBuf) -> Option<String> {
+    let p = data.join("autoplay.json");
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<String>(&s).ok())
+}
+
+/// Persist `id` as the autoplay target, or clear it if `id` is None.
+pub fn save_autoplay(data: &PathBuf, id: Option<&str>) {
+    let p = data.join("autoplay.json");
+    match id {
+        Some(id) => { let _ = fs::write(p, serde_json::to_string(id).unwrap()); }
+        None     => { let _ = fs::remove_file(p); }
+    }
+}
+
 pub fn boot_dir(data: &PathBuf) -> PathBuf {
     let d = data.join("boot");
     fs::create_dir_all(&d).ok();

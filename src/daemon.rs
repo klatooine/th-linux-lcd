@@ -1,4 +1,4 @@
-use crate::shared::{socket_path, Cmd, DaemonStatus, Resp};
+use crate::shared::{self, socket_path, Cmd, DaemonStatus, Resp};
 use crate::usb;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +15,7 @@ struct UsbState {
     fps: f32,
     playing_id: Option<String>,
     next_frame: Instant,
+    autoplay_restored: bool,
 }
 
 impl Default for UsbState {
@@ -26,6 +27,7 @@ impl Default for UsbState {
             fps: 15.0,
             playing_id: None,
             next_frame: Instant::now(),
+            autoplay_restored: false,
         }
     }
 }
@@ -65,6 +67,32 @@ fn usb_thread(
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
+            // Device just opened — restore autoplay if set and not yet started
+            if !state.autoplay_restored {
+                state.autoplay_restored = true;
+                let data = shared::data_dir();
+                if let Some(id) = shared::load_autoplay(&data) {
+                    let videos = shared::load_videos(&data);
+                    if let Some(v) = videos.iter().find(|v| v.id == id) {
+                        let base = shared::frames_dir(&data, &v.id);
+                        let frames_dir = if v.rotation != 0 {
+                            base.with_file_name(format!("{}-rotated", v.id))
+                        } else {
+                            base
+                        };
+                        let frames = load_frames(frames_dir.to_str().unwrap_or(""), v.frame_count);
+                        if !frames.is_empty() {
+                            eprintln!("[daemon] autoplay: {} ({} frames @ {}fps)", v.name, frames.len(), v.fps);
+                            state.frames = frames;
+                            state.fps = v.fps;
+                            state.frame_idx = 0;
+                            state.playing = true;
+                            state.playing_id = Some(v.id.clone());
+                            state.next_frame = Instant::now();
+                        }
+                    }
+                }
+            }
         }
 
         // Drain all pending commands (non-blocking)
@@ -76,14 +104,16 @@ fn usb_thread(
                         state.fps = fps;
                         state.frame_idx = 0;
                         state.playing = true;
-                        state.playing_id = Some(id);
+                        state.playing_id = Some(id.clone());
                         state.next_frame = Instant::now();
+                        shared::save_autoplay(&shared::data_dir(), Some(&id));
                         eprintln!("[daemon] play: {} frames @ {}fps", state.frames.len(), fps);
                     }
                     UsbCmd::Stop => {
                         state.playing = false;
                         state.playing_id = None;
                         state.frames.clear();
+                        shared::save_autoplay(&shared::data_dir(), None);
                         eprintln!("[daemon] stop");
                     }
                     UsbCmd::ScreenOn => {
