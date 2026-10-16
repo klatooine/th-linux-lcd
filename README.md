@@ -3,6 +3,8 @@
 A Linux app for the LCD screen on the **Thermaltake TH420V2 Ultra** AIO cooler (USB `264a:233c`).
 Stream GIFs to the screen, set the standby image, and set the boot animation, with no Windows required.
 
+![TH Linux LCD](docs/screenshot.png)
+
 > [!WARNING]
 > Unofficial and unsupported. Not affiliated with Thermaltake. The standby image and boot animation are
 > written to the cooler's flash memory using a reverse-engineered protocol. It works on the author's unit,
