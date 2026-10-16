@@ -93,7 +93,7 @@ The daemon validates everything it receives before touching the device: ids must
 
 The USB thread owns the device handle and runs an event loop:
 
-1. If no device: try `usb::open()` every 2 s (errors are logged only when they change). While idle, check every 5 s that the device is still on the bus.
+1. If no device: try `usb::open()` every 2 s (errors are logged only when they change). While idle, check every 5 s that the device is still on the bus. A libusb hotplug callback (on its own `hotplug` thread) wakes the loop immediately when the cooler is plugged in or unplugged, so both are noticed at once; polling remains the fallback. An active stream is kept across an unplug and resumes when the device returns.
 2. Publish `DaemonStatus` when it changes.
 3. Block on the command channel until the next frame is due, the flash-settle period ends, or the next reconnect attempt — whichever is first.
 4. If streaming and a frame is due: `usb::send_frame()`; on error drop the handle and reconnect.
@@ -150,6 +150,7 @@ videos.json      Vec<Video>      — imported GIF manifest
 standby.json     Vec<StandbyImage>
 boot.json        Vec<BootAnim>
 autoplay.json    id of the video to resume when the daemon starts
+on_device.json   ids of the standby image / boot animation last written by the app (the device has no read-back command)
 frames/<id>/     f00001.jpg … fNNNNN.jpg  (extracted animation frames)
 frames/<id>-rotated/                      (cached rotated frames)
 standby/<id>.jpg                          (converted standby images)

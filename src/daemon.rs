@@ -30,14 +30,69 @@ static QUIT: AtomicBool = AtomicBool::new(false);
 type Reply = SyncSender<Result<(), String>>;
 
 enum UsbCmd {
-    Play { frames: Vec<Vec<u8>>, fps: f32, id: String },
+    Play {
+        frames: Vec<Vec<u8>>,
+        fps: f32,
+        id: String,
+    },
     Stop,
     Screen(bool),
-    Upload { slot: usb::Slot, data: Vec<u8>, deadline: Instant },
+    Upload {
+        slot: usb::Slot,
+        data: Vec<u8>,
+        deadline: Instant,
+    },
+    /// libusb hotplug event for our VID:PID (true = plugged in).
+    Hotplug(bool),
     Quit,
 }
 
 type Job = (UsbCmd, Option<Reply>);
+
+/// Forwards libusb hotplug events to the USB thread so plugging / unplugging
+/// is noticed immediately instead of at the next poll.
+struct HotplugWaker(SyncSender<Job>);
+
+impl rusb::Hotplug<rusb::GlobalContext> for HotplugWaker {
+    fn device_arrived(&mut self, _device: rusb::Device<rusb::GlobalContext>) {
+        let _ = self.0.try_send((UsbCmd::Hotplug(true), None));
+    }
+
+    fn device_left(&mut self, _device: rusb::Device<rusb::GlobalContext>) {
+        let _ = self.0.try_send((UsbCmd::Hotplug(false), None));
+    }
+}
+
+/// Register for hotplug events and run the libusb event loop on its own
+/// thread. Without hotplug support the USB thread's polling still works.
+fn start_hotplug(tx: SyncSender<Job>) {
+    if !rusb::has_hotplug() {
+        eprintln!("[usb] libusb has no hotplug support; polling for the device instead");
+        return;
+    }
+    let ctx = rusb::GlobalContext::default();
+    let registration = rusb::HotplugBuilder::new()
+        .vendor_id(usb::VID)
+        .product_id(usb::PID)
+        .enumerate(false)
+        .register(ctx, Box::new(HotplugWaker(tx)));
+    let registration = match registration {
+        Ok(r) => r,
+        Err(e) => return eprintln!("[usb] hotplug registration failed ({e}); polling instead"),
+    };
+    let spawned = std::thread::Builder::new().name("hotplug".into()).spawn(move || {
+        let _registration = registration;
+        loop {
+            if let Err(e) = rusb::UsbContext::handle_events(&ctx, None) {
+                eprintln!("[usb] hotplug event loop: {e}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[usb] cannot start hotplug thread: {e}");
+    }
+}
 
 /// Read a regular file, refusing anything larger than `max` bytes.
 fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>, String> {
@@ -295,6 +350,20 @@ impl UsbThread {
                     }
                 }
             }
+            UsbCmd::Hotplug(true) => {
+                if self.device.is_none() {
+                    eprintln!("[usb] device plugged in");
+                    self.last_open_attempt = None; // open on the next loop iteration
+                }
+                Ok(())
+            }
+            UsbCmd::Hotplug(false) => {
+                if self.device.as_ref().is_some_and(|d| !usb::still_connected(d)) {
+                    eprintln!("[usb] device unplugged");
+                    self.device = None;
+                }
+                Ok(())
+            }
             UsbCmd::Quit => {
                 eprintln!("[daemon] shutting down");
                 self.quitting = true;
@@ -505,6 +574,8 @@ pub fn run() -> i32 {
             eprintln!("[daemon] cannot install signal handler: {e}");
         }
     }
+
+    start_hotplug(tx.clone());
 
     {
         let status = Arc::clone(&status);

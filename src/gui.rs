@@ -1,5 +1,5 @@
 use eframe::egui;
-use egui::{Color32, FontId, Pos2, RichText, Stroke, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, FontId, Pos2, Rect, RichText, Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use th_linux_lcd::import;
 use th_linux_lcd::shared::{
     self, daemon_cmd, decode_thumbnail, frame_file, frames_dir, make_thumbnail, rotated_frames_dir, socket_path,
-    BootAnim, Cmd, DaemonStatus, Resp, StandbyImage, Video,
+    BootAnim, Cmd, DaemonStatus, OnDevice, Resp, StandbyImage, Video,
 };
 use uuid::Uuid;
 
@@ -26,52 +26,256 @@ const GREEN: Color32 = Color32::from_rgb(0, 210, 55);
 const GREEN_DIM: Color32 = Color32::from_rgb(0, 38, 10);
 const GREEN_MID: Color32 = Color32::from_rgb(0, 90, 24);
 const BG: Color32 = Color32::from_rgb(11, 11, 11);
+const BG_BAR: Color32 = Color32::from_rgb(7, 7, 7);
 const BG_PANEL: Color32 = Color32::from_rgb(15, 15, 15);
 const BG_CARD: Color32 = Color32::from_rgb(20, 24, 20);
 const BG_SEL: Color32 = Color32::from_rgb(10, 28, 13);
+const BG_HOVER: Color32 = Color32::from_rgb(16, 22, 17);
 const BORDER: Color32 = Color32::from_rgb(0, 48, 13);
 const BORDER_SEL: Color32 = Color32::from_rgb(0, 160, 44);
 const RED: Color32 = Color32::from_rgb(210, 45, 45);
+const RED_DIM: Color32 = Color32::from_rgb(28, 7, 7);
+const ORANGE: Color32 = Color32::from_rgb(180, 70, 0);
 const AMBER: Color32 = Color32::from_rgb(200, 150, 0);
 const TEXT_DIM: Color32 = Color32::from_rgb(0, 100, 28);
+const TEXT_FAINT: Color32 = Color32::from_rgb(0, 64, 18);
 
-const STATUS_POLL: Duration = Duration::from_secs(2);
-const THUMB_CARD: f32 = 88.0;
-const PREVIEW_SIZE: f32 = 180.0;
+const STATUS_POLL: Duration = Duration::from_secs(1);
+const CARD_SIZE: f32 = 96.0;
+const CARD_LABEL_H: f32 = 18.0;
+const PREVIEW_SIZE: f32 = 190.0;
+const RADIUS: f32 = 6.0;
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 fn setup_theme(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
-    v.window_fill = BG;
+    v.window_fill = BG_PANEL;
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
     v.extreme_bg_color = Color32::from_rgb(6, 6, 6);
     v.faint_bg_color = BG_CARD;
     v.override_text_color = Some(GREEN);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_DIM);
     v.widgets.inactive.bg_fill = BG_CARD;
+    v.widgets.inactive.weak_bg_fill = BG_CARD;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, GREEN_MID);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(18, 32, 20);
+    v.widgets.hovered.bg_fill = BG_HOVER;
+    v.widgets.hovered.weak_bg_fill = BG_HOVER;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, GREEN_MID);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, GREEN);
     v.widgets.active.bg_fill = GREEN_DIM;
+    v.widgets.active.weak_bg_fill = GREEN_DIM;
     v.widgets.active.bg_stroke = Stroke::new(1.0_f32, GREEN);
     v.widgets.active.fg_stroke = Stroke::new(1.0_f32, GREEN);
+    for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+        w.rounding = Rounding::same(4.0);
+    }
     v.selection.bg_fill = GREEN_DIM;
     v.selection.stroke = Stroke::new(1.0_f32, GREEN);
-    v.window_rounding = egui::Rounding::same(4.0);
+    v.window_rounding = Rounding::same(RADIUS);
     v.window_shadow = eframe::epaint::Shadow::NONE;
     ctx.set_visuals(v);
 
     let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = Vec2::new(6.0, 5.0);
-    style.spacing.button_padding = Vec2::new(10.0, 6.0);
+    style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+    style.spacing.button_padding = Vec2::new(12.0, 6.0);
     style.spacing.window_margin = egui::Margin::same(0.0);
     style.spacing.scroll.bar_width = 5.0;
     ctx.set_style(style);
     ctx.set_pixels_per_point(1.1);
+}
+
+fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
+    RichText::new(text).monospace().size(size).color(color)
+}
+
+// ── Widgets ───────────────────────────────────────────────────────────────────
+
+/// Main call to action: filled green when enabled.
+fn primary_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(mono(label, 12.0, if enabled { GREEN } else { TEXT_FAINT }))
+            .fill(if enabled { GREEN_DIM } else { BG_CARD })
+            .stroke(Stroke::new(1.0_f32, if enabled { GREEN_MID } else { BORDER }))
+            .min_size(Vec2::new(150.0, 32.0)),
+    )
+    .clicked()
+}
+
+fn danger_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add(
+        egui::Button::new(mono(label, 12.0, RED))
+            .fill(RED_DIM)
+            .stroke(Stroke::new(1.0_f32, RED))
+            .min_size(Vec2::new(150.0, 32.0)),
+    )
+    .clicked()
+}
+
+/// Secondary action: outline only.
+fn ghost_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(mono(label, 10.5, if enabled { GREEN } else { TEXT_FAINT }))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0_f32, if enabled { GREEN_MID } else { BORDER })),
+    )
+    .clicked()
+}
+
+/// Small square button for a single glyph, with a hover hint.
+fn icon_button(ui: &mut egui::Ui, enabled: bool, glyph: &str, hint: &str) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(glyph).size(15.0).color(if enabled { GREEN } else { TEXT_FAINT }))
+            .fill(BG_CARD)
+            .stroke(Stroke::new(1.0_f32, BORDER))
+            .min_size(Vec2::new(32.0, 32.0)),
+    )
+    .on_hover_text(hint)
+    .clicked()
+}
+
+/// Rounded tag, e.g. "ON LCD".
+fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::none()
+        .stroke(Stroke::new(1.0_f32, color))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(7.0, 2.0))
+        .show(ui, |ui| ui.label(mono(text, 9.5, color)));
+}
+
+fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::none()
+        .fill(Color32::from_black_alpha(120))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
+        .rounding(Rounding::same(12.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.5, color);
+                ui.label(mono(text, 10.5, color));
+            });
+        });
+}
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(BG_PANEL)
+        .stroke(Stroke::new(1.0_f32, BORDER))
+        .rounding(Rounding::same(RADIUS))
+        .inner_margin(egui::Margin::same(16.0))
+}
+
+fn draw_circle_image(painter: &egui::Painter, center: Pos2, radius: f32, tex_id: egui::TextureId) {
+    let n = 64u32;
+    let mut mesh = egui::Mesh::with_texture(tex_id);
+    let push = |mesh: &mut egui::Mesh, pos: Pos2, uv: Pos2| {
+        mesh.vertices.push(eframe::epaint::Vertex { pos, uv, color: Color32::WHITE });
+    };
+    push(&mut mesh, center, egui::pos2(0.5, 0.5));
+    for i in 0..=n {
+        let angle = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        push(&mut mesh, center + Vec2::new(cos, sin) * radius, egui::pos2(0.5 + cos * 0.5, 0.5 + sin * 0.5));
+        if i > 0 {
+            mesh.indices.extend([0, i, i + 1]);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Round LCD-style preview; `active` lights the ring.
+fn preview_circle(ui: &mut egui::Ui, tex: Option<&TextureHandle>, active: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(PREVIEW_SIZE), Sense::hover());
+    let center = rect.center();
+    let r = PREVIEW_SIZE / 2.0;
+    let p = ui.painter();
+    p.circle_filled(center, r, Color32::from_rgb(4, 4, 4));
+    match tex {
+        Some(tex) => draw_circle_image(p, center, r - 3.0, tex.id()),
+        None => {
+            p.text(center, egui::Align2::CENTER_CENTER, "NO SIGNAL", FontId::monospace(10.0), TEXT_FAINT);
+        }
+    }
+    p.circle_stroke(center, r - 1.0, Stroke::new(2.0_f32, if active { GREEN } else { BORDER }));
+}
+
+/// One gallery tile. Returns (clicked, delete clicked).
+fn gallery_card(
+    ui: &mut egui::Ui,
+    id: &str,
+    name: &str,
+    tex: Option<egui::TextureId>,
+    selected: bool,
+    marker: Option<Color32>,
+) -> (bool, bool) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(CARD_SIZE, CARD_SIZE + CARD_LABEL_H), Sense::click());
+    let del_rect = Rect::from_center_size(rect.right_top() + Vec2::new(-12.0, 12.0), Vec2::splat(18.0));
+    let del_resp = ui.interact(del_rect, egui::Id::new(("del", id)), Sense::click());
+    let hovered = resp.hovered() || del_resp.hovered();
+    let p = ui.painter();
+
+    let fill = if selected {
+        BG_SEL
+    } else if hovered {
+        BG_HOVER
+    } else {
+        BG_CARD
+    };
+    let stroke = if selected { Stroke::new(1.5_f32, BORDER_SEL) } else { Stroke::new(1.0_f32, BORDER) };
+    p.rect_filled(rect, RADIUS, fill);
+
+    let img = Rect::from_min_size(rect.min, Vec2::splat(CARD_SIZE)).shrink(5.0);
+    match tex {
+        Some(tid) => {
+            p.image(tid, img, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        None => {
+            p.rect_filled(img, 3.0, Color32::from_rgb(6, 6, 6));
+        }
+    }
+    p.rect_stroke(rect, RADIUS, stroke);
+
+    let label: String = if name.chars().count() > 13 {
+        format!("{}…", name.chars().take(12).collect::<String>())
+    } else {
+        name.to_string()
+    };
+    let label_pos = egui::pos2(rect.center().x, rect.max.y - CARD_LABEL_H / 2.0 - 1.0);
+    p.text(
+        label_pos,
+        egui::Align2::CENTER_CENTER,
+        label,
+        FontId::monospace(9.0),
+        if selected { GREEN } else { TEXT_DIM },
+    );
+
+    if let Some(color) = marker {
+        let c = img.left_top() + Vec2::new(8.0, 8.0);
+        p.circle_filled(c, 5.0, Color32::from_black_alpha(200));
+        p.circle_filled(c, 3.5, color);
+    }
+    if hovered {
+        let bg = if del_resp.hovered() { RED } else { Color32::from_rgba_premultiplied(40, 6, 6, 230) };
+        p.circle_filled(del_rect.center(), 9.0, bg);
+        p.text(
+            del_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            FontId::proportional(13.0),
+            if del_resp.hovered() { Color32::WHITE } else { RED },
+        );
+    }
+
+    let del_clicked = del_resp.clicked();
+    (resp.clicked() && !del_clicked, del_clicked)
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -83,9 +287,36 @@ enum Tab {
     Boot,
 }
 
+impl Tab {
+    const ALL: [Tab; 3] = [Tab::Animation, Tab::Standby, Tab::Boot];
+
+    fn title(self) -> &'static str {
+        match self {
+            Tab::Animation => "ANIMATION",
+            Tab::Standby => "STANDBY",
+            Tab::Boot => "BOOT",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Tab::Animation => "live stream",
+            Tab::Standby => "idle image",
+            Tab::Boot => "power-on",
+        }
+    }
+}
+
+/// Which flash slot an upload targets, and the library item written.
+#[derive(Clone)]
+enum UploadTarget {
+    Standby(String),
+    Boot(String),
+}
+
 /// Result of work done off the UI thread. `Ok(None)` means the user cancelled.
 enum BgDone {
-    Daemon(Result<(), String>, &'static str),
+    Uploaded(Result<(), String>, &'static str, UploadTarget),
     VideoImported(Result<Option<Video>, String>),
     StandbyImported(Result<Option<StandbyImage>, String>),
     BootImported(Result<Option<BootAnim>, String>),
@@ -98,11 +329,10 @@ struct BgTask {
     label: String,
 }
 
-/// An upload to device flash awaiting user confirmation.
-struct PendingUpload {
-    cmd: Cmd,
-    what: &'static str,
-    done_msg: &'static str,
+/// An action awaiting confirmation in a dialog.
+enum Confirm {
+    Upload { cmd: Cmd, what: &'static str, done_msg: &'static str, target: UploadTarget },
+    Delete { tab: Tab, id: String, name: String },
 }
 
 pub struct App {
@@ -110,6 +340,7 @@ pub struct App {
     videos: Vec<Video>,
     standby: Vec<StandbyImage>,
     boot_anims: Vec<BootAnim>,
+    on_device: OnDevice,
     tab: Tab,
     selected_video: Option<String>,
     selected_standby: Option<String>,
@@ -124,7 +355,7 @@ pub struct App {
     last_status_poll: Option<Instant>,
     daemon_connected: bool,
     daemon_child: Option<Child>,
-    confirm: Option<PendingUpload>,
+    confirm: Option<Confirm>,
     instance: GuiInstance,
 }
 
@@ -282,6 +513,8 @@ impl Drop for GuiInstance {
     }
 }
 
+// ── App: state & actions ──────────────────────────────────────────────────────
+
 impl App {
     fn new(cc: &eframe::CreationContext, instance: GuiInstance) -> Self {
         setup_theme(&cc.egui_ctx);
@@ -291,17 +524,17 @@ impl App {
         let (standby, e2) = shared::load_standby(&data);
         let (boot_anims, e3) = shared::load_boot(&data);
         let warnings: Vec<String> = [e1, e2, e3].into_iter().flatten().collect();
-        let selected_video = videos.first().map(|v| v.id.clone());
 
         let mut app = App {
+            on_device: shared::load_on_device(&data),
+            selected_video: videos.first().map(|v| v.id.clone()),
+            selected_standby: standby.first().map(|i| i.id.clone()),
+            selected_boot: boot_anims.first().map(|a| a.id.clone()),
             data_dir: data,
             videos,
             standby,
             boot_anims,
             tab: Tab::Animation,
-            selected_video,
-            selected_standby: None,
-            selected_boot: None,
             daemon_status: DaemonStatus::default(),
             status_msg: String::new(),
             preview_texture: None,
@@ -366,8 +599,6 @@ impl App {
         self.last_status_poll = None;
     }
 
-    // ── Persistence ───────────────────────────────────────────────────────────
-
     fn save_videos(&mut self) {
         if let Err(e) = shared::save_videos(&self.data_dir, &self.videos) {
             self.status_msg = format!("Error: {e}");
@@ -386,8 +617,6 @@ impl App {
         }
     }
 
-    // ── Thumbnails ────────────────────────────────────────────────────────────
-
     fn get_thumb(&mut self, ctx: &egui::Context, id: &str, b64: &str) -> Option<egui::TextureId> {
         if !self.thumb_cache.contains_key(id) {
             if let Some((pixels, size)) = decode_thumbnail(b64) {
@@ -398,59 +627,58 @@ impl App {
         self.thumb_cache.get(id).map(|t| t.id())
     }
 
-    // ── Preview ───────────────────────────────────────────────────────────────
+    fn set_preview_from_bytes(&mut self, ctx: &egui::Context, name: &str, bytes: &[u8]) {
+        if let Ok(img) = image::load_from_memory(bytes) {
+            let rgba = img.to_rgba8();
+            let ci = egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba);
+            self.preview_texture = Some(ctx.load_texture(name, ci, TextureOptions::LINEAR));
+        }
+    }
 
     fn tick_anim_preview(&mut self, ctx: &egui::Context) {
-        let Some(ref id) = self.selected_video.clone() else { return };
-        let Some(video) = self.videos.iter().find(|v| v.id == *id) else { return };
+        let Some(id) = self.selected_video.clone() else { return };
+        let Some(video) = self.videos.iter().find(|v| v.id == id) else { return };
         if video.frame_count == 0 {
             return;
         }
+        let frame_count = video.frame_count;
         let frame_dur = Duration::from_secs_f32(1.0 / video.fps.max(1.0));
-        if self.last_frame_time.elapsed() >= frame_dur {
-            self.preview_frame_idx = (self.preview_frame_idx + 1) % video.frame_count;
+        if self.preview_texture.is_none() || self.last_frame_time.elapsed() >= frame_dur {
+            self.preview_frame_idx = (self.preview_frame_idx + 1) % frame_count;
             self.last_frame_time = Instant::now();
-            let path = frame_file(&frames_dir(&self.data_dir, id), self.preview_frame_idx + 1);
+            let path = frame_file(&frames_dir(&self.data_dir, &id), self.preview_frame_idx + 1);
             if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(img) = image::load_from_memory(&bytes) {
-                    let rgba = img.to_rgba8();
-                    let ci = egui::ColorImage::from_rgba_unmultiplied(
-                        [rgba.width() as usize, rgba.height() as usize],
-                        &rgba,
-                    );
-                    self.preview_texture = Some(ctx.load_texture("preview", ci, TextureOptions::LINEAR));
-                }
+                self.set_preview_from_bytes(ctx, "preview", &bytes);
             }
         }
         ctx.request_repaint_after(frame_dur);
     }
 
-    fn load_standby_preview(&mut self, ctx: &egui::Context) {
-        let Some(ref id) = self.selected_standby.clone() else { return };
-        let Some(img) = self.standby.iter().find(|i| i.id == *id) else { return };
-        if let Ok(bytes) = std::fs::read(&img.path) {
-            if let Ok(decoded) = image::load_from_memory(&bytes) {
-                let rgba = decoded.to_rgba8();
-                let ci =
-                    egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba);
-                self.preview_texture = Some(ctx.load_texture("preview_sb", ci, TextureOptions::LINEAR));
-            }
-        }
-    }
-
-    fn load_boot_preview(&mut self, ctx: &egui::Context) {
-        let Some(ref id) = self.selected_boot.clone() else { return };
-        let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) else { return };
-        if anim.thumbnail.is_empty() {
+    fn load_static_preview(&mut self, ctx: &egui::Context) {
+        if self.preview_texture.is_some() {
             return;
         }
-        if let Some((pixels, size)) = decode_thumbnail(&anim.thumbnail) {
-            let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-            self.preview_texture = Some(ctx.load_texture("preview_boot", ci, TextureOptions::LINEAR));
+        match self.tab {
+            Tab::Standby => {
+                let Some(id) = &self.selected_standby else { return };
+                let Some(path) = self.standby.iter().find(|i| &i.id == id).map(|i| i.path.clone()) else { return };
+                if let Ok(bytes) = std::fs::read(path) {
+                    self.set_preview_from_bytes(ctx, "preview_sb", &bytes);
+                }
+            }
+            Tab::Boot => {
+                let Some(id) = &self.selected_boot else { return };
+                let Some(thumb) = self.boot_anims.iter().find(|a| &a.id == id).map(|a| a.thumbnail.clone()) else {
+                    return;
+                };
+                if let Some((pixels, size)) = decode_thumbnail(&thumb) {
+                    let ci = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                    self.preview_texture = Some(ctx.load_texture("preview_boot", ci, TextureOptions::LINEAR));
+                }
+            }
+            Tab::Animation => {}
         }
     }
-
-    // ── Daemon ────────────────────────────────────────────────────────────────
 
     fn poll_status(&mut self) {
         if self.last_status_poll.is_some_and(|t| t.elapsed() < STATUS_POLL) {
@@ -472,12 +700,12 @@ impl App {
         }
     }
 
-    fn daemon_up(&self) -> bool {
-        self.daemon_connected
-    }
-
     fn busy(&self) -> bool {
         self.bg_task.is_some() || self.daemon_status.flash_busy
+    }
+
+    fn can_write(&self) -> bool {
+        !self.busy() && self.daemon_connected && self.daemon_status.device_found
     }
 
     /// Send a quick command synchronously; returns true on success.
@@ -526,11 +754,20 @@ impl App {
     fn finish_bg(&mut self, done: BgDone) {
         self.last_status_poll = None;
         match done {
-            BgDone::Daemon(Ok(()), msg) => self.status_msg = msg.into(),
-            BgDone::Daemon(Err(e), _) => self.status_msg = format!("Error: {e}"),
+            BgDone::Uploaded(Ok(()), msg, target) => {
+                self.status_msg = msg.into();
+                match target {
+                    UploadTarget::Standby(id) => self.on_device.standby = Some(id),
+                    UploadTarget::Boot(id) => self.on_device.boot = Some(id),
+                }
+                if let Err(e) = shared::save_on_device(&self.data_dir, &self.on_device) {
+                    self.status_msg = format!("{msg} (could not record it: {e})");
+                }
+            }
+            BgDone::Uploaded(Err(e), _, _) => self.status_msg = format!("Error: {e}"),
 
             BgDone::VideoImported(Ok(Some(v))) => {
-                self.status_msg = format!("Imported {} frames @ {:.0}fps", v.frame_count, v.fps);
+                self.status_msg = format!("Imported {} frames @ {:.0} fps", v.frame_count, v.fps);
                 self.selected_video = Some(v.id.clone());
                 self.videos.push(v);
                 self.save_videos();
@@ -545,7 +782,7 @@ impl App {
                 self.preview_texture = None;
             }
             BgDone::BootImported(Ok(Some(anim))) => {
-                self.status_msg = format!("Boot animation: {} frames @ {:.1}fps", anim.frame_count, anim.fps);
+                self.status_msg = format!("Boot animation: {} frames @ {:.1} fps", anim.frame_count, anim.fps);
                 self.selected_boot = Some(anim.id.clone());
                 self.boot_anims.push(anim);
                 self.save_boot();
@@ -561,6 +798,11 @@ impl App {
             BgDone::BootRotated(Ok(anim)) => {
                 self.status_msg = format!("Rotated to {}°", anim.rotation);
                 self.thumb_cache.remove(&anim.id);
+                // The rebuilt container is no longer what is on the device.
+                if self.on_device.boot.as_deref() == Some(&anim.id) {
+                    self.on_device.boot = None;
+                    let _ = shared::save_on_device(&self.data_dir, &self.on_device);
+                }
                 if let Some(a) = self.boot_anims.iter_mut().find(|a| a.id == anim.id) {
                     *a = anim;
                 }
@@ -578,33 +820,31 @@ impl App {
         }
     }
 
-    // ── Actions ───────────────────────────────────────────────────────────────
-
-    fn add_video(&mut self) {
+    fn add_item(&mut self) {
         let data = self.data_dir.clone();
-        self.spawn_bg("Importing GIF...", move || BgDone::VideoImported(import_video_task(&data)));
-    }
-
-    fn add_standby(&mut self) {
-        let data = self.data_dir.clone();
-        self.spawn_bg("Converting image...", move || BgDone::StandbyImported(import_standby_task(&data)));
-    }
-
-    fn add_boot(&mut self) {
-        let data = self.data_dir.clone();
-        self.spawn_bg("Importing boot animation...", move || BgDone::BootImported(import_boot_task(&data)));
+        match self.tab {
+            Tab::Animation => {
+                self.spawn_bg("Importing GIF...", move || BgDone::VideoImported(import_video_task(&data)));
+            }
+            Tab::Standby => {
+                self.spawn_bg("Converting image...", move || BgDone::StandbyImported(import_standby_task(&data)));
+            }
+            Tab::Boot => {
+                self.spawn_bg("Building boot animation...", move || BgDone::BootImported(import_boot_task(&data)));
+            }
+        }
     }
 
     fn rotate_video(&mut self, id: &str, delta: i32) {
         let Some(v) = self.videos.iter_mut().find(|v| v.id == id) else { return };
         v.rotation = (v.rotation + delta).rem_euclid(360);
         let new_rot = v.rotation;
-        // Invalidate cached rotated frames so next play regenerates them
+        // Invalidate cached rotated frames so the next play regenerates them
         if shared::is_valid_id(id) {
             let _ = std::fs::remove_dir_all(rotated_frames_dir(&self.data_dir, id));
         }
         self.save_videos();
-        self.status_msg = format!("Rotation: {new_rot}°");
+        self.status_msg = format!("Rotation {new_rot}° (applied when sent to the LCD)");
     }
 
     fn rotate_boot(&mut self, id: &str, delta: i32) {
@@ -640,229 +880,540 @@ impl App {
         });
     }
 
-    fn start_upload(&mut self, p: PendingUpload) {
-        let label = format!("Writing {} to device flash. Do not unplug or power off...", p.what);
+    fn start_upload(&mut self, cmd: Cmd, what: &'static str, done_msg: &'static str, target: UploadTarget) {
+        let label = format!("Writing {what} to device flash. Do not unplug or power off...");
         self.status_msg.clear();
         self.spawn_bg(label, move || {
-            let result = match daemon_cmd(&p.cmd) {
+            let result = match daemon_cmd(&cmd) {
                 Ok(Resp::Ok) => Ok(()),
                 Ok(Resp::Err { msg }) => Err(msg),
                 Ok(Resp::Status(_)) => Err("unexpected reply from daemon".into()),
                 Err(e) => Err(e),
             };
-            BgDone::Daemon(result, p.done_msg)
+            BgDone::Uploaded(result, done_msg, target)
         });
     }
 
-    fn confirm_dialog(&mut self, ctx: &egui::Context) {
-        let Some(p) = &self.confirm else { return };
+    fn delete_item(&mut self, tab: Tab, id: &str) {
+        match tab {
+            Tab::Animation => {
+                if self.daemon_status.playing_id.as_deref() == Some(id) {
+                    self.send(Cmd::Stop);
+                }
+                if shared::is_valid_id(id) {
+                    let _ = std::fs::remove_dir_all(frames_dir(&self.data_dir, id));
+                    let _ = std::fs::remove_dir_all(rotated_frames_dir(&self.data_dir, id));
+                }
+                self.videos.retain(|v| v.id != id);
+                self.save_videos();
+                if self.selected_video.as_deref() == Some(id) {
+                    self.selected_video = self.videos.first().map(|v| v.id.clone());
+                }
+            }
+            Tab::Standby => {
+                if let Some(img) = self.standby.iter().find(|i| i.id == id) {
+                    let _ = std::fs::remove_file(&img.path);
+                }
+                self.standby.retain(|i| i.id != id);
+                self.save_standby();
+                if self.selected_standby.as_deref() == Some(id) {
+                    self.selected_standby = self.standby.first().map(|i| i.id.clone());
+                }
+            }
+            Tab::Boot => {
+                if let Some(anim) = self.boot_anims.iter().find(|a| a.id == id) {
+                    let _ = std::fs::remove_file(&anim.path);
+                }
+                self.boot_anims.retain(|a| a.id != id);
+                self.save_boot();
+                if self.selected_boot.as_deref() == Some(id) {
+                    self.selected_boot = self.boot_anims.first().map(|a| a.id.clone());
+                }
+            }
+        }
+        self.thumb_cache.remove(id);
+        self.preview_texture = None;
+    }
+
+    fn select(&mut self, id: String) {
+        let slot = match self.tab {
+            Tab::Animation => &mut self.selected_video,
+            Tab::Standby => &mut self.selected_standby,
+            Tab::Boot => &mut self.selected_boot,
+        };
+        if slot.as_deref() != Some(&id) {
+            *slot = Some(id);
+            self.preview_frame_idx = 0;
+            self.preview_texture = None;
+        }
+    }
+
+    fn switch_tab(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.preview_texture = None;
+        }
+    }
+}
+
+// ── App: UI ───────────────────────────────────────────────────────────────────
+
+/// (id, name, base64 thumbnail)
+type GalleryItem = (String, String, String);
+
+/// What the hero card shows for the selected item.
+struct Hero {
+    name: String,
+    meta: String,
+    badges: Vec<(&'static str, Color32)>,
+    rotation: Option<i32>,
+    live: bool,
+}
+
+impl App {
+    fn device_state(&self) -> (&'static str, Color32) {
+        if !self.daemon_connected {
+            ("NO DAEMON", RED)
+        } else if !self.daemon_status.device_found {
+            ("NO DEVICE", ORANGE)
+        } else if self.daemon_status.flash_busy {
+            ("WRITING FLASH", AMBER)
+        } else if self.daemon_status.streaming {
+            ("STREAMING", GREEN)
+        } else {
+            ("IDLE", AMBER)
+        }
+    }
+
+    fn ui_top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("topbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_BAR)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(egui::Margin::symmetric(16.0, 9.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(mono("TH LINUX LCD", 14.0, GREEN).strong());
+                    ui.label(mono("TH420V2 Ultra", 10.0, TEXT_FAINT));
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Screen on/off as one joined control
+                        let enabled = self.daemon_connected && self.daemon_status.device_found;
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let seg = |label: &str, color: Color32, rounding: Rounding| {
+                            egui::Button::new(mono(label, 10.5, if enabled { color } else { TEXT_FAINT }))
+                                .fill(BG_CARD)
+                                .stroke(Stroke::new(1.0_f32, BORDER))
+                                .rounding(rounding)
+                                .min_size(Vec2::new(40.0, 26.0))
+                        };
+                        let right = Rounding { ne: 4.0, se: 4.0, ..Default::default() };
+                        let left = Rounding { nw: 4.0, sw: 4.0, ..Default::default() };
+                        if ui.add_enabled(enabled, seg("OFF", RED, right)).on_hover_text("Turn the LCD off").clicked() {
+                            self.send(Cmd::ScreenOff);
+                        }
+                        if ui.add_enabled(enabled, seg("ON", GREEN, left)).on_hover_text("Turn the LCD on").clicked() {
+                            self.send(Cmd::ScreenOn);
+                        }
+                        ui.add_space(6.0);
+                        ui.label(mono("SCREEN", 9.5, TEXT_FAINT));
+                        ui.add_space(14.0);
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        if !self.daemon_connected && ghost_button(ui, true, "START DAEMON") {
+                            self.ensure_daemon();
+                        }
+                        let (text, color) = self.device_state();
+                        status_pill(ui, text, color);
+                    });
+                });
+            });
+    }
+
+    fn ui_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(
+                egui::Frame::none()
+                    .fill(BG_BAR)
+                    .stroke(Stroke::new(1.0_f32, BORDER))
+                    .inner_margin(egui::Margin::symmetric(16.0, 6.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(task) = &self.bg_task {
+                        ui.add(egui::Spinner::new().size(11.0).color(AMBER));
+                        ui.label(mono(&task.label, 10.0, AMBER));
+                    } else if self.daemon_status.flash_busy {
+                        ui.add(egui::Spinner::new().size(11.0).color(AMBER));
+                        ui.label(mono("Device is writing flash. Do not unplug or power off...", 10.0, AMBER));
+                    } else if !self.status_msg.is_empty() {
+                        let color =
+                            if self.status_msg.starts_with("Error") || self.status_msg.starts_with("Import failed") {
+                                RED
+                            } else {
+                                TEXT_DIM
+                            };
+                        ui.label(mono(&self.status_msg, 10.0, color));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.daemon_status.streaming && self.daemon_status.fps > 0.0 {
+                            ui.label(mono(format!("{:.0} fps", self.daemon_status.fps), 10.0, TEXT_FAINT));
+                        }
+                    });
+                });
+            });
+    }
+
+    fn ui_sidebar(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .exact_width(132.0)
+            .frame(egui::Frame::none().fill(BG_PANEL).stroke(Stroke::new(1.0_f32, BORDER)).inner_margin(egui::Margin {
+                left: 0.0,
+                right: 8.0,
+                top: 14.0,
+                bottom: 12.0,
+            }))
+            .show(ctx, |ui| {
+                for (i, tab) in Tab::ALL.into_iter().enumerate() {
+                    let active = self.tab == tab;
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
+                    let p = ui.painter();
+                    let row = rect.with_min_x(rect.min.x + 8.0);
+                    if active {
+                        p.rect_filled(row, 4.0, BG_SEL);
+                        p.rect_filled(Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())), 0.0, GREEN);
+                    } else if resp.hovered() {
+                        p.rect_filled(row, 4.0, BG_HOVER);
+                    }
+                    let x = row.min.x + 12.0;
+                    p.text(
+                        egui::pos2(x, row.center().y - 6.0),
+                        egui::Align2::LEFT_CENTER,
+                        tab.title(),
+                        FontId::monospace(11.0),
+                        if active { GREEN } else { TEXT_DIM },
+                    );
+                    p.text(
+                        egui::pos2(x, row.center().y + 8.0),
+                        egui::Align2::LEFT_CENTER,
+                        tab.subtitle(),
+                        FontId::monospace(8.5),
+                        if active { TEXT_DIM } else { TEXT_FAINT },
+                    );
+                    if resp.on_hover_text(format!("Ctrl+{}", i + 1)).clicked() {
+                        self.switch_tab(tab);
+                    }
+                    ui.add_space(4.0);
+                }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.label(mono(concat!("v", env!("CARGO_PKG_VERSION")), 9.0, TEXT_FAINT));
+                    });
+                });
+            });
+    }
+
+    fn hero(&self) -> Option<Hero> {
+        match self.tab {
+            Tab::Animation => {
+                let v = self.videos.iter().find(|v| Some(&v.id) == self.selected_video.as_ref())?;
+                let live = self.daemon_status.streaming && self.daemon_status.playing_id.as_deref() == Some(&v.id);
+                Some(Hero {
+                    name: v.name.clone(),
+                    meta: format!("{} frames · {:.0} fps · {}°", v.frame_count, v.fps, v.rotation),
+                    badges: if live { vec![("STREAMING", GREEN)] } else { vec![] },
+                    rotation: Some(v.rotation),
+                    live,
+                })
+            }
+            Tab::Standby => {
+                let img = self.standby.iter().find(|i| Some(&i.id) == self.selected_standby.as_ref())?;
+                let size = std::fs::metadata(&img.path).map(|m| m.len()).unwrap_or(0);
+                let on = self.on_device.standby.as_deref() == Some(&img.id);
+                Some(Hero {
+                    name: img.name.clone(),
+                    meta: format!("480×480 JPEG · {} KB", size.div_ceil(1024)),
+                    badges: if on { vec![("ON LCD", GREEN)] } else { vec![] },
+                    rotation: None,
+                    live: on,
+                })
+            }
+            Tab::Boot => {
+                let a = self.boot_anims.iter().find(|a| Some(&a.id) == self.selected_boot.as_ref())?;
+                let on = self.on_device.boot.as_deref() == Some(&a.id);
+                Some(Hero {
+                    name: a.name.clone(),
+                    meta: format!("{} frames · {:.1} fps · {}°", a.frame_count, a.fps, a.rotation),
+                    badges: if on { vec![("ON LCD", GREEN)] } else { vec![] },
+                    rotation: Some(a.rotation),
+                    live: on,
+                })
+            }
+        }
+    }
+
+    fn ui_hero(&mut self, ui: &mut egui::Ui) {
+        let hero = self.hero();
+        card_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                preview_circle(ui, self.preview_texture.as_ref(), hero.as_ref().is_some_and(|h| h.live));
+                ui.add_space(20.0);
+                ui.vertical(|ui| {
+                    ui.add_space(14.0);
+                    let Some(hero) = hero else {
+                        ui.label(mono("Nothing selected", 15.0, TEXT_DIM));
+                        ui.add_space(4.0);
+                        ui.label(mono("Pick one below, or add a new one.", 10.5, TEXT_FAINT));
+                        return;
+                    };
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(mono(&hero.name, 15.0, GREEN).strong()).truncate());
+                        for (text, color) in &hero.badges {
+                            badge(ui, text, *color);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label(mono(&hero.meta, 10.5, TEXT_DIM));
+                    ui.add_space(16.0);
+
+                    ui.horizontal(|ui| {
+                        if let Some(rot) = hero.rotation {
+                            self.ui_rotate(ui, rot);
+                            ui.add_space(10.0);
+                        }
+                        self.ui_primary_action(ui, hero.live);
+                    });
+                    ui.add_space(8.0);
+                    let (hint, color) = match self.tab {
+                        Tab::Animation => ("Streams over USB. Nothing is written to the device.", TEXT_FAINT),
+                        Tab::Standby => ("⚠ Writes to device flash.", AMBER),
+                        Tab::Boot => ("⚠ Writes to device flash. Power-cycle the cooler to see it.", AMBER),
+                    };
+                    ui.label(mono(hint, 9.5, color));
+                });
+            });
+        });
+    }
+
+    fn ui_rotate(&mut self, ui: &mut egui::Ui, rotation: i32) {
+        let enabled = self.bg_task.is_none();
+        let hint = match self.tab {
+            Tab::Boot => "re-encodes the animation",
+            _ => "applied when sent to the LCD",
+        };
+        let mut delta = 0;
+        if icon_button(ui, enabled, "↺", &format!("Rotate left ({hint})")) {
+            delta = -90;
+        }
+        ui.label(mono(format!("{rotation:>3}°"), 10.5, TEXT_DIM));
+        if icon_button(ui, enabled, "↻", &format!("Rotate right ({hint})")) {
+            delta = 90;
+        }
+        if delta == 0 {
+            return;
+        }
+        match self.tab {
+            Tab::Animation => {
+                if let Some(id) = self.selected_video.clone() {
+                    self.rotate_video(&id, delta);
+                }
+            }
+            Tab::Boot => {
+                if let Some(id) = self.selected_boot.clone() {
+                    self.rotate_boot(&id, delta);
+                }
+            }
+            Tab::Standby => {}
+        }
+    }
+
+    fn ui_primary_action(&mut self, ui: &mut egui::Ui, live: bool) {
+        match self.tab {
+            Tab::Animation => {
+                if live {
+                    if danger_button(ui, "■  STOP") && self.send(Cmd::Stop) {
+                        self.status_msg = "Stopped".into();
+                    }
+                } else if primary_button(ui, self.bg_task.is_none() && self.daemon_connected, "▶  SEND TO LCD") {
+                    self.play_selected();
+                }
+            }
+            Tab::Standby => {
+                if primary_button(ui, self.can_write(), "WRITE TO LCD") {
+                    if let Some(img) = self.standby.iter().find(|i| Some(&i.id) == self.selected_standby.as_ref()) {
+                        self.confirm = Some(Confirm::Upload {
+                            cmd: Cmd::UploadStandby { path: img.path.clone() },
+                            what: "standby image",
+                            done_msg: "Standby image written.",
+                            target: UploadTarget::Standby(img.id.clone()),
+                        });
+                    }
+                }
+            }
+            Tab::Boot => {
+                if primary_button(ui, self.can_write(), "WRITE TO LCD") {
+                    if let Some(a) = self.boot_anims.iter().find(|a| Some(&a.id) == self.selected_boot.as_ref()) {
+                        self.confirm = Some(Confirm::Upload {
+                            cmd: Cmd::UploadBoot { path: a.path.clone() },
+                            what: "boot animation",
+                            done_msg: "Boot animation written. Power-cycle the cooler to see it.",
+                            target: UploadTarget::Boot(a.id.clone()),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    fn ui_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let (title, add_label, empty) = match self.tab {
+            Tab::Animation => ("ANIMATIONS", "+ ADD GIF", "No animations yet. Add a GIF to stream it to the LCD."),
+            Tab::Standby => ("STANDBY IMAGES", "+ ADD IMAGE", "No standby images yet. Add a JPEG, PNG or GIF."),
+            Tab::Boot => ("BOOT ANIMATIONS", "+ ADD GIF", "No boot animations yet. Add a GIF to build one."),
+        };
+        let (items, selected, marked): (Vec<GalleryItem>, Option<String>, Option<String>) = match self.tab {
+            Tab::Animation => (
+                self.videos.iter().map(|v| (v.id.clone(), v.name.clone(), v.thumbnail.clone())).collect(),
+                self.selected_video.clone(),
+                self.daemon_status.playing_id.clone().filter(|_| self.daemon_status.streaming),
+            ),
+            Tab::Standby => (
+                self.standby.iter().map(|i| (i.id.clone(), i.name.clone(), i.thumbnail.clone())).collect(),
+                self.selected_standby.clone(),
+                self.on_device.standby.clone(),
+            ),
+            Tab::Boot => (
+                self.boot_anims.iter().map(|a| (a.id.clone(), a.name.clone(), a.thumbnail.clone())).collect(),
+                self.selected_boot.clone(),
+                self.on_device.boot.clone(),
+            ),
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(mono(title, 10.5, TEXT_DIM));
+            ui.label(mono(items.len().to_string(), 10.5, TEXT_FAINT));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ghost_button(ui, self.bg_task.is_none(), add_label) {
+                    self.add_item();
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        if items.is_empty() {
+            ui.add_space(30.0);
+            ui.vertical_centered(|ui| ui.label(mono(empty, 10.5, TEXT_FAINT)));
+            return;
+        }
+
+        let mut clicked = None;
+        let mut delete = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(10.0);
+                for (id, name, b64) in &items {
+                    let tex = self.get_thumb(ctx, id, b64);
+                    let marker = (marked.as_deref() == Some(id.as_str())).then_some(GREEN);
+                    let (c, d) = gallery_card(ui, id, name, tex, selected.as_deref() == Some(id), marker);
+                    if c {
+                        clicked = Some(id.clone());
+                    }
+                    if d {
+                        delete = Some((id.clone(), name.clone()));
+                    }
+                }
+            });
+        });
+
+        if let Some(id) = clicked {
+            self.select(id);
+        }
+        if let Some((id, name)) = delete {
+            self.confirm = Some(Confirm::Delete { tab: self.tab, id, name });
+        }
+    }
+
+    fn ui_confirm(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else { return };
+        let (title, body, ok_label, ok_color) = match confirm {
+            Confirm::Upload { what, .. } => (
+                "Write to device flash?",
+                format!(
+                    "This writes the {what} to the cooler's flash memory.\n\n\
+                     Do not unplug the USB cable or power off the PC until the status bar says it is done \
+                     (up to about a minute).\n\n\
+                     This is unofficial software. Use at your own risk."
+                ),
+                "WRITE",
+                GREEN,
+            ),
+            Confirm::Delete { name, .. } => {
+                ("Delete from library?", format!("Remove \"{name}\" from your library?"), "DELETE", RED)
+            }
+        };
+
+        // Dim the app behind the dialog.
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("confirm_backdrop")).order(egui::Order::Middle).fixed_pos(screen.min).show(
+            ctx,
+            |ui| {
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(160));
+                ui.allocate_rect(screen, Sense::click());
+            },
+        );
+
         let mut decision = None;
-        egui::Window::new("Write to device flash?")
+        egui::Window::new(title)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
+            .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .frame(egui::Frame::window(&ctx.style()).fill(BG_PANEL).inner_margin(egui::Margin::same(14.0)))
+            .frame(card_frame().inner_margin(egui::Margin::same(20.0)))
             .show(ctx, |ui| {
-                ui.set_max_width(340.0);
-                ui.label(
-                    RichText::new(format!(
-                        "This writes the {} to the cooler's flash memory.\n\n\
-                     Do not unplug the USB cable or power off the PC until the status bar \
-                     says it is done (up to about a minute).\n\n\
-                     This is unofficial software. Use at your own risk.",
-                        p.what
-                    ))
-                    .color(GREEN)
-                    .size(11.0),
-                );
+                ui.set_max_width(360.0);
+                ui.label(mono(title, 13.0, ok_color).strong());
                 ui.add_space(10.0);
+                ui.label(mono(body, 10.5, GREEN));
+                ui.add_space(16.0);
                 ui.horizontal(|ui| {
+                    let fill = if ok_color == RED { RED_DIM } else { GREEN_DIM };
                     if ui
                         .add(
-                            egui::Button::new(RichText::new("WRITE").color(GREEN).monospace())
-                                .fill(GREEN_DIM)
-                                .stroke(Stroke::new(1.0_f32, GREEN_MID)),
+                            egui::Button::new(mono(ok_label, 11.0, ok_color))
+                                .fill(fill)
+                                .stroke(Stroke::new(1.0_f32, ok_color))
+                                .min_size(Vec2::new(90.0, 28.0)),
                         )
                         .clicked()
                     {
                         decision = Some(true);
                     }
-                    if ui.button(RichText::new("CANCEL").color(TEXT_DIM).monospace()).clicked() {
+                    if ghost_button(ui, true, "CANCEL") {
                         decision = Some(false);
                     }
                 });
             });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
         match decision {
-            Some(true) => {
-                if let Some(p) = self.confirm.take() {
-                    self.start_upload(p);
-                }
-            }
+            Some(true) => match self.confirm.take() {
+                Some(Confirm::Upload { cmd, what, done_msg, target }) => self.start_upload(cmd, what, done_msg, target),
+                Some(Confirm::Delete { tab, id, .. }) => self.delete_item(tab, &id),
+                None => {}
+            },
             Some(false) => self.confirm = None,
             None => {}
         }
     }
 }
-
-// ── Circle image draw (mesh-based, no corner hacks) ───────────────────────────
-
-fn draw_circle_image(painter: &egui::Painter, center: Pos2, radius: f32, tex_id: egui::TextureId) {
-    let n = 64u32;
-    let mut mesh = egui::Mesh::with_texture(tex_id);
-
-    let push = |mesh: &mut egui::Mesh, pos: Pos2, uv: egui::Pos2| {
-        mesh.vertices.push(eframe::epaint::Vertex { pos, uv, color: Color32::WHITE });
-    };
-
-    // Center vertex at UV (0.5, 0.5)
-    push(&mut mesh, center, egui::pos2(0.5, 0.5));
-
-    for i in 0..=n {
-        let angle = i as f32 / n as f32 * std::f32::consts::TAU;
-        let cos = angle.cos();
-        let sin = angle.sin();
-        let pos = center + Vec2::new(cos, sin) * radius;
-        let uv = egui::pos2(0.5 + cos * 0.5, 0.5 + sin * 0.5);
-        push(&mut mesh, pos, uv);
-        if i > 0 {
-            mesh.indices.push(0);
-            mesh.indices.push(i);
-            mesh.indices.push(i + 1);
-        }
-    }
-
-    painter.add(egui::Shape::mesh(mesh));
-}
-
-/// Circular preview of the current texture; `ring` colours the outline.
-fn preview_circle(ui: &mut egui::Ui, tex: Option<&TextureHandle>, ring: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(PREVIEW_SIZE), egui::Sense::hover());
-    let center = rect.center();
-    let r = PREVIEW_SIZE / 2.0;
-    let p = ui.painter();
-    p.circle_filled(center, r, Color32::from_rgb(5, 5, 5));
-    if let Some(tex) = tex {
-        draw_circle_image(p, center, r - 1.0, tex.id());
-    } else {
-        p.text(center, egui::Align2::CENTER_CENTER, "NO SIGNAL", FontId::monospace(10.0), TEXT_DIM);
-    }
-    p.circle_stroke(center, r - 1.0, Stroke::new(2.0_f32, ring));
-}
-
-/// Primary action button (green when enabled).
-fn primary_button(ui: &mut egui::Ui, enabled: bool, label: &str) -> bool {
-    ui.add_enabled(
-        enabled,
-        egui::Button::new(RichText::new(label).color(if enabled { GREEN } else { TEXT_DIM }).monospace().size(12.0))
-            .fill(if enabled { GREEN_DIM } else { BG_CARD })
-            .stroke(Stroke::new(1.0_f32, if enabled { GREEN_MID } else { BORDER }))
-            .min_size(Vec2::new(140.0, 30.0)),
-    )
-    .clicked()
-}
-
-// ── Gallery card ──────────────────────────────────────────────────────────────
-
-fn gallery_card(
-    ui: &mut egui::Ui,
-    id: &str,
-    name: &str,
-    tex: Option<egui::TextureId>,
-    selected: bool,
-    size: f32,
-) -> (bool, bool) {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), egui::Sense::click());
-    let del_rect = egui::Rect::from_min_size(egui::pos2(rect.max.x - 18.0, rect.min.y), Vec2::splat(18.0));
-
-    // Always register delete interaction so egui tracks hover/click on it
-    let del_resp = ui.interact(del_rect, egui::Id::new(("del", id)), egui::Sense::click());
-
-    let hovered = resp.hovered() || del_resp.hovered();
-    let p = ui.painter();
-
-    p.rect_filled(rect, 4.0, if selected { BG_SEL } else { BG_CARD });
-    p.rect_stroke(
-        rect,
-        4.0,
-        Stroke::new(if selected { 1.5_f32 } else { 1.0_f32 }, if selected { BORDER_SEL } else { BORDER }),
-    );
-
-    if let Some(tid) = tex {
-        let img_r = rect.shrink(4.0).with_max_y(rect.max.y - 17.0);
-        p.image(tid, img_r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-    }
-
-    let name_r = egui::Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 17.0), rect.max);
-    p.rect_filled(name_r, egui::Rounding { sw: 4.0, se: 4.0, ..Default::default() }, Color32::from_black_alpha(210));
-    let label: std::borrow::Cow<str> = if name.chars().count() > 13 {
-        format!("{}…", name.chars().take(12).collect::<String>()).into()
-    } else {
-        name.into()
-    };
-    p.text(
-        name_r.center(),
-        egui::Align2::CENTER_CENTER,
-        label.as_ref(),
-        FontId::monospace(8.0),
-        if selected { GREEN } else { TEXT_DIM },
-    );
-
-    if hovered {
-        p.rect_filled(
-            del_rect,
-            egui::Rounding { ne: 4.0, ..Default::default() },
-            Color32::from_rgba_premultiplied(90, 10, 10, 230),
-        );
-        p.text(del_rect.center(), egui::Align2::CENTER_CENTER, "x", FontId::proportional(10.0), RED);
-    }
-
-    let del_clicked = del_resp.clicked();
-    (resp.clicked() && !del_clicked, del_clicked)
-}
-
-/// Gallery grid; returns (clicked id, delete-clicked id).
-fn gallery(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    ctx: &egui::Context,
-    scroll_id: &str,
-    items: Vec<(String, String, String)>,
-    selected: Option<&str>,
-) -> (Option<String>, Option<String>) {
-    let mut sel = None;
-    let mut del = None;
-    egui::ScrollArea::vertical().id_salt(scroll_id).show(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            ui.style_mut().spacing.item_spacing = Vec2::splat(5.0);
-            for (id, name, b64) in &items {
-                let tex = app.get_thumb(ctx, id, b64);
-                let (clicked, deleted) = gallery_card(ui, id, name, tex, selected == Some(id.as_str()), THUMB_CARD);
-                if clicked {
-                    sel = Some(id.clone());
-                }
-                if deleted {
-                    del = Some(id.clone());
-                }
-            }
-        });
-    });
-    (sel, del)
-}
-
-fn section_header(ui: &mut egui::Ui, title: &str, button: &str, enabled: bool) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).color(TEXT_DIM).monospace().size(10.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            clicked = ui
-                .add_enabled(enabled, egui::Button::new(RichText::new(button).color(TEXT_DIM).monospace().size(10.0)))
-                .clicked();
-        });
-    });
-    clicked
-}
-
-// ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -874,484 +1425,36 @@ impl eframe::App for App {
         }
         self.poll_bg();
         self.poll_status();
-        ctx.request_repaint_after(if self.bg_task.is_some() { Duration::from_millis(200) } else { STATUS_POLL });
+        ctx.request_repaint_after(if self.bg_task.is_some() { Duration::from_millis(100) } else { STATUS_POLL });
 
-        if self.tab == Tab::Animation {
-            self.tick_anim_preview(ctx);
-        }
-        if self.tab == Tab::Standby && self.preview_texture.is_none() {
-            self.load_standby_preview(ctx);
-        }
-        if self.tab == Tab::Boot && self.preview_texture.is_none() {
-            self.load_boot_preview(ctx);
-        }
-
-        self.confirm_dialog(ctx);
-
-        // ── Top bar ───────────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("topbar")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(7, 7, 7)).inner_margin(egui::Margin {
-                left: 14.0,
-                right: 14.0,
-                top: 7.0,
-                bottom: 7.0,
-            }))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("TH LINUX LCD").color(GREEN).monospace().size(14.0).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // OFF button
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("OFF").color(Color32::from_rgb(170, 35, 35)).monospace().size(11.0),
-                                )
-                                .fill(Color32::from_rgb(28, 7, 7))
-                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(90, 18, 18)))
-                                .min_size(Vec2::new(40.0, 24.0)),
-                            )
-                            .clicked()
-                        {
-                            self.send(Cmd::ScreenOff);
-                        }
-
-                        // ON button
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("ON").color(GREEN).monospace().size(11.0))
-                                    .fill(GREEN_DIM)
-                                    .stroke(Stroke::new(1.0_f32, GREEN_MID))
-                                    .min_size(Vec2::new(40.0, 24.0)),
-                            )
-                            .clicked()
-                        {
-                            self.send(Cmd::ScreenOn);
-                        }
-
-                        ui.add_space(6.0);
-
-                        // Status dot + label
-                        let (dot, text, text_color) = if !self.daemon_up() {
-                            (RED, "NO DAEMON", RED)
-                        } else if !self.daemon_status.device_found {
-                            (Color32::from_rgb(180, 70, 0), "NO DEVICE", Color32::from_rgb(180, 70, 0))
-                        } else if self.daemon_status.flash_busy {
-                            (AMBER, "WRITING FLASH", AMBER)
-                        } else if self.daemon_status.streaming {
-                            (GREEN, "STREAMING", GREEN)
-                        } else {
-                            (AMBER, "IDLE", AMBER)
-                        };
-
-                        ui.label(RichText::new(text).color(text_color).monospace().size(11.0));
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 4.0, dot);
-
-                        if !self.daemon_up() {
-                            ui.add_space(6.0);
-                            if ui.button(RichText::new("START").color(TEXT_DIM).monospace().size(10.0)).clicked() {
-                                self.ensure_daemon();
-                            }
-                        } else if !self.daemon_status.device_found {
-                            ui.add_space(6.0);
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new("RETRY")
-                                            .color(Color32::from_rgb(180, 70, 0))
-                                            .monospace()
-                                            .size(10.0),
-                                    )
-                                    .fill(Color32::from_rgb(28, 14, 0))
-                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(120, 50, 0)))
-                                    .min_size(Vec2::new(44.0, 22.0)),
-                                )
-                                .clicked()
-                            {
-                                self.last_status_poll = None;
-                            }
-                        }
-                    });
-                });
+        if self.confirm.is_none() {
+            let pressed = ctx.input(|i| {
+                [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3]
+                    .iter()
+                    .position(|&k| i.modifiers.command && i.key_pressed(k))
             });
+            if let Some(i) = pressed {
+                self.switch_tab(Tab::ALL[i]);
+            }
+        }
 
-        // ── Bottom status bar ─────────────────────────────────────────────────
-        egui::TopBottomPanel::bottom("statusbar")
-            .frame(egui::Frame::none().fill(Color32::from_rgb(7, 7, 7)).inner_margin(egui::Margin {
-                left: 14.0,
-                right: 14.0,
-                top: 5.0,
-                bottom: 5.0,
-            }))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(ref task) = self.bg_task {
-                        let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
-                        ui.painter().circle_filled(r.center(), 4.0, AMBER);
-                        ui.label(RichText::new(&task.label).color(AMBER).monospace().size(10.0));
-                    } else if !self.status_msg.is_empty() {
-                        ui.label(RichText::new(&self.status_msg).color(TEXT_DIM).monospace().size(10.0));
-                    }
-                });
-            });
+        match self.tab {
+            Tab::Animation => self.tick_anim_preview(ctx),
+            _ => self.load_static_preview(ctx),
+        }
 
-        // ── Left sidebar ──────────────────────────────────────────────────────
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .exact_width(110.0)
-            .frame(egui::Frame::none().fill(BG_PANEL).inner_margin(egui::Margin {
-                left: 8.0,
-                right: 8.0,
-                top: 12.0,
-                bottom: 12.0,
-            }))
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                for (t, lbl) in [(Tab::Animation, "ANIMATION"), (Tab::Standby, "STANDBY"), (Tab::Boot, "BOOT")] {
-                    let active = self.tab == t;
-                    let btn = egui::Button::new(
-                        RichText::new(lbl).color(if active { GREEN } else { TEXT_DIM }).monospace().size(11.0),
-                    )
-                    .fill(if active { BG_SEL } else { Color32::TRANSPARENT })
-                    .stroke(Stroke::new(
-                        if active { 1.0_f32 } else { 0.0_f32 },
-                        if active { BORDER_SEL } else { Color32::TRANSPARENT },
-                    ))
-                    .min_size(Vec2::new(ui.available_width(), 30.0));
-                    if ui.add(btn).clicked() && self.tab != t {
-                        self.tab = t;
-                        self.preview_texture = None;
-                    }
-                    ui.add_space(2.0);
-                }
-            });
-
-        // ── Main content ──────────────────────────────────────────────────────
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::same(14.0))).show(
+        self.ui_top_bar(ctx);
+        self.ui_status_bar(ctx);
+        self.ui_sidebar(ctx);
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(BG).inner_margin(egui::Margin::same(18.0))).show(
             ctx,
-            |ui| match self.tab {
-                Tab::Animation => self.ui_animation(ui, ctx),
-                Tab::Standby => self.ui_standby(ui, ctx),
-                Tab::Boot => self.ui_boot(ui, ctx),
+            |ui| {
+                self.ui_hero(ui);
+                ui.add_space(18.0);
+                self.ui_gallery(ui, ctx);
             },
         );
-    }
-}
-
-impl App {
-    fn ui_animation(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // Top section: preview left, info+button right
-        ui.horizontal(|ui| {
-            let ring = if self.daemon_status.streaming { Color32::from_rgb(0, 150, 38) } else { BORDER };
-            preview_circle(ui, self.preview_texture.as_ref(), ring);
-
-            ui.add_space(16.0);
-
-            // Info + controls
-            ui.vertical(|ui| {
-                ui.add_space(8.0);
-                if let Some(ref id) = self.selected_video.clone() {
-                    if let Some(v) = self.videos.iter().find(|v| v.id == *id) {
-                        ui.label(RichText::new(&v.name).color(GREEN).monospace().size(12.0));
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("{} frames  {:.0} fps", v.frame_count, v.fps))
-                                .color(TEXT_DIM)
-                                .monospace()
-                                .size(10.0),
-                        );
-                        ui.add_space(6.0);
-
-                        // Rotation controls
-                        let rot = v.rotation;
-                        let vid_id = id.clone();
-                        ui.horizontal(|ui| {
-                            let btn_size = Vec2::new(28.0, 24.0);
-                            let small_btn = |label: &str| {
-                                egui::Button::new(RichText::new(label).color(TEXT_DIM).monospace().size(11.0))
-                                    .fill(BG_CARD)
-                                    .stroke(Stroke::new(1.0_f32, BORDER))
-                                    .min_size(btn_size)
-                            };
-                            if ui.add(small_btn("CCW")).clicked() {
-                                self.rotate_video(&vid_id, -90);
-                            }
-                            ui.label(RichText::new(format!("{}°", rot)).color(TEXT_DIM).monospace().size(10.0));
-                            if ui.add(small_btn("CW")).clicked() {
-                                self.rotate_video(&vid_id, 90);
-                            }
-                        });
-                    }
-                } else {
-                    ui.label(RichText::new("no animation selected").color(TEXT_DIM).monospace().size(11.0));
-                }
-
-                ui.add_space(8.0);
-
-                let has_sel = self.selected_video.is_some();
-                let is_playing = self.daemon_status.streaming && self.daemon_status.playing_id == self.selected_video;
-
-                if is_playing {
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("STOP").color(RED).monospace().size(12.0))
-                                .fill(Color32::from_rgb(28, 6, 6))
-                                .stroke(Stroke::new(1.0_f32, RED))
-                                .min_size(Vec2::new(140.0, 30.0)),
-                        )
-                        .clicked()
-                        && self.send(Cmd::Stop)
-                    {
-                        self.status_msg = "Stopped".into();
-                    }
-                } else if primary_button(ui, has_sel && self.bg_task.is_none(), "SEND TO LCD") {
-                    self.play_selected();
-                }
-            });
-        });
-
-        ui.add_space(14.0);
-        ui.add(egui::Separator::default().horizontal());
-        ui.add_space(6.0);
-
-        if section_header(ui, "ANIMATIONS", "+ ADD GIF", self.bg_task.is_none()) {
-            self.add_video();
-        }
-        ui.add_space(6.0);
-
-        if self.videos.is_empty() {
-            ui.label(
-                RichText::new("No animations — import a GIF to get started").color(TEXT_DIM).monospace().size(11.0),
-            );
-            return;
-        }
-
-        let items = self.videos.iter().map(|v| (v.id.clone(), v.name.clone(), v.thumbnail.clone())).collect();
-        let selected = self.selected_video.clone();
-        let (sel, del) = gallery(self, ui, ctx, "anim_scroll", items, selected.as_deref());
-
-        if let Some(id) = sel {
-            if self.selected_video.as_deref() != Some(&id) {
-                self.selected_video = Some(id);
-                self.preview_frame_idx = 0;
-                self.preview_texture = None;
-            }
-        }
-        if let Some(id) = del {
-            if self.daemon_status.playing_id.as_deref() == Some(&id) {
-                self.send(Cmd::Stop);
-            }
-            if shared::is_valid_id(&id) {
-                let _ = std::fs::remove_dir_all(frames_dir(&self.data_dir, &id));
-                let _ = std::fs::remove_dir_all(rotated_frames_dir(&self.data_dir, &id));
-            }
-            self.videos.retain(|v| v.id != id);
-            self.save_videos();
-            self.thumb_cache.remove(&id);
-            if self.selected_video.as_deref() == Some(&id) {
-                self.selected_video = self.videos.first().map(|v| v.id.clone());
-                self.preview_texture = None;
-            }
-        }
-    }
-
-    fn ui_standby(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            preview_circle(ui, self.preview_texture.as_ref(), BORDER);
-
-            ui.add_space(16.0);
-
-            ui.vertical(|ui| {
-                ui.add_space(8.0);
-                if let Some(ref id) = self.selected_standby.clone() {
-                    if let Some(img) = self.standby.iter().find(|i| i.id == *id) {
-                        ui.label(RichText::new(&img.name).color(GREEN).monospace().size(12.0));
-                    }
-                } else {
-                    ui.label(RichText::new("no image selected").color(TEXT_DIM).monospace().size(11.0));
-                }
-
-                ui.add_space(12.0);
-
-                let busy = self.busy();
-                let enabled = self.selected_standby.is_some() && !busy && self.daemon_status.device_found;
-                let lbl = if busy { "BUSY..." } else { "UPLOAD TO LCD" };
-
-                if primary_button(ui, enabled, lbl) {
-                    if let Some(id) = &self.selected_standby {
-                        if let Some(img) = self.standby.iter().find(|i| i.id == *id) {
-                            self.confirm = Some(PendingUpload {
-                                cmd: Cmd::UploadStandby { path: img.path.clone() },
-                                what: "standby image",
-                                done_msg: "Standby image written.",
-                            });
-                        }
-                    }
-                }
-            });
-        });
-
-        ui.add_space(14.0);
-        ui.add(egui::Separator::default().horizontal());
-        ui.add_space(6.0);
-
-        if section_header(ui, "STANDBY IMAGES", "+ ADD IMAGE", self.bg_task.is_none()) {
-            self.add_standby();
-        }
-        ui.add_space(6.0);
-
-        if self.standby.is_empty() {
-            ui.label(
-                RichText::new("No standby images — import one to get started").color(TEXT_DIM).monospace().size(11.0),
-            );
-            return;
-        }
-
-        let items = self.standby.iter().map(|i| (i.id.clone(), i.name.clone(), i.thumbnail.clone())).collect();
-        let selected = self.selected_standby.clone();
-        let (sel, del) = gallery(self, ui, ctx, "sb_scroll", items, selected.as_deref());
-
-        if let Some(id) = sel {
-            if self.selected_standby.as_deref() != Some(&id) {
-                self.selected_standby = Some(id);
-                self.preview_texture = None;
-            }
-        }
-        if let Some(id) = del {
-            if let Some(img) = self.standby.iter().find(|i| i.id == id) {
-                let _ = std::fs::remove_file(&img.path);
-            }
-            self.standby.retain(|i| i.id != id);
-            self.save_standby();
-            self.thumb_cache.remove(&id);
-            if self.selected_standby.as_deref() == Some(&id) {
-                self.selected_standby = None;
-                self.preview_texture = None;
-            }
-        }
-    }
-
-    fn ui_boot(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            preview_circle(ui, self.preview_texture.as_ref(), BORDER);
-
-            ui.add_space(16.0);
-
-            ui.vertical(|ui| {
-                ui.add_space(8.0);
-                if let Some(ref id) = self.selected_boot.clone() {
-                    if let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) {
-                        ui.label(RichText::new(&anim.name).color(GREEN).monospace().size(12.0));
-                        ui.add_space(2.0);
-                        ui.label(
-                            RichText::new(format!("{} frames  {:.1} fps", anim.frame_count, anim.fps))
-                                .color(TEXT_DIM)
-                                .monospace()
-                                .size(10.0),
-                        );
-                    }
-                } else {
-                    ui.label(RichText::new("no boot animation selected").color(TEXT_DIM).monospace().size(11.0));
-                }
-
-                ui.add_space(12.0);
-
-                let has_sel = self.selected_boot.is_some();
-                let busy = self.busy();
-                let enabled = has_sel && !busy && self.daemon_status.device_found;
-                let lbl = if busy { "BUSY..." } else { "UPLOAD TO LCD" };
-
-                if primary_button(ui, enabled, lbl) {
-                    if let Some(id) = &self.selected_boot {
-                        if let Some(anim) = self.boot_anims.iter().find(|a| a.id == *id) {
-                            self.confirm = Some(PendingUpload {
-                                cmd: Cmd::UploadBoot { path: anim.path.clone() },
-                                what: "boot animation",
-                                done_msg: "Boot animation written. Power-cycle the cooler to see it.",
-                            });
-                        }
-                    }
-                }
-
-                ui.add_space(8.0);
-
-                let rot_enabled = has_sel && !busy;
-                let rot_lbl = if let Some(ref id) = self.selected_boot {
-                    self.boot_anims.iter().find(|a| a.id == *id).map(|a| format!("{}°", a.rotation)).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                if !rot_lbl.is_empty() {
-                    ui.label(RichText::new(&rot_lbl).color(TEXT_DIM).monospace().size(11.0));
-                }
-                if ui
-                    .add_enabled(
-                        rot_enabled,
-                        egui::Button::new(RichText::new("↻ 90°").color(TEXT_DIM).monospace().size(11.0))
-                            .min_size(Vec2::new(55.0, 26.0)),
-                    )
-                    .clicked()
-                {
-                    if let Some(id) = self.selected_boot.clone() {
-                        self.rotate_boot(&id, 90);
-                    }
-                }
-                if ui
-                    .add_enabled(
-                        rot_enabled,
-                        egui::Button::new(RichText::new("↺ 90°").color(TEXT_DIM).monospace().size(11.0))
-                            .min_size(Vec2::new(55.0, 26.0)),
-                    )
-                    .clicked()
-                {
-                    if let Some(id) = self.selected_boot.clone() {
-                        self.rotate_boot(&id, -90);
-                    }
-                }
-            });
-        });
-
-        ui.add_space(14.0);
-        ui.add(egui::Separator::default().horizontal());
-        ui.add_space(6.0);
-
-        if section_header(ui, "BOOT ANIMATIONS", "+ ADD GIF", self.bg_task.is_none()) {
-            self.add_boot();
-        }
-        ui.add_space(6.0);
-
-        if self.boot_anims.is_empty() {
-            ui.label(
-                RichText::new("No boot animations — import a GIF to get started")
-                    .color(TEXT_DIM)
-                    .monospace()
-                    .size(11.0),
-            );
-            return;
-        }
-
-        let items = self.boot_anims.iter().map(|a| (a.id.clone(), a.name.clone(), a.thumbnail.clone())).collect();
-        let selected = self.selected_boot.clone();
-        let (sel, del) = gallery(self, ui, ctx, "boot_scroll", items, selected.as_deref());
-
-        if let Some(id) = sel {
-            if self.selected_boot.as_deref() != Some(&id) {
-                self.selected_boot = Some(id);
-                self.preview_texture = None;
-            }
-        }
-        if let Some(id) = del {
-            if let Some(anim) = self.boot_anims.iter().find(|a| a.id == id) {
-                let _ = std::fs::remove_file(&anim.path);
-            }
-            self.boot_anims.retain(|a| a.id != id);
-            self.save_boot();
-            self.thumb_cache.remove(&id);
-            if self.selected_boot.as_deref() == Some(&id) {
-                self.selected_boot = None;
-                self.preview_texture = None;
-            }
-        }
+        self.ui_confirm(ctx);
     }
 }
 
@@ -1366,8 +1469,8 @@ pub fn run() {
         viewport: egui::ViewportBuilder::default()
             .with_title("TH Linux LCD")
             .with_app_id("th-linux-lcd")
-            .with_inner_size([640.0, 520.0])
-            .with_min_inner_size([500.0, 400.0])
+            .with_inner_size([720.0, 560.0])
+            .with_min_inner_size([560.0, 440.0])
             .with_resizable(true),
         ..Default::default()
     };

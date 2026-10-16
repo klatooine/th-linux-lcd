@@ -298,6 +298,28 @@ pub fn save_autoplay(data: &Path, id: Option<&str>) -> Result<(), String> {
     }
 }
 
+// ── What is on the device ─────────────────────────────────────────────────────
+
+const ON_DEVICE_JSON: &str = "on_device.json";
+
+/// Library ids of the standby image / boot animation last written to the
+/// device by this app. The protocol has no read-back command, so this is the
+/// only record of what is in the flash slots.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct OnDevice {
+    pub standby: Option<String>,
+    pub boot: Option<String>,
+}
+
+pub fn load_on_device(data: &Path) -> OnDevice {
+    fs::read_to_string(data.join(ON_DEVICE_JSON)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_on_device(data: &Path, state: &OnDevice) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
+    write_atomic(&data.join(ON_DEVICE_JSON), &json)
+}
+
 // ── Boot container (Update_Boot_GIF) ──────────────────────────────────────────
 
 const BOOT_MAGIC: &[u8; 15] = b"Update_Boot_GIF";
