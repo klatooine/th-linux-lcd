@@ -1,7 +1,10 @@
 #!/bin/bash
 # th-linux-lcd installer
-# Installs dependencies, configures USB permissions, builds, and installs the app.
-# Run from the repository root.
+# Installs dependencies, configures USB permissions, builds, and installs the
+# app for the current user.
+#
+#   bash install.sh              install or upgrade
+#   bash install.sh --uninstall  remove everything except your library data
 
 set -euo pipefail
 
@@ -11,61 +14,69 @@ warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
 error()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 ok()      { echo -e "${GREEN}[✓]${NC} $*"; }
 
+MIN_RUST="1.89.0"
+BIN_DIR="$HOME/.local/bin"
+SVC_DIR="$HOME/.config/systemd/user"
+APPS_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+RULE_NAME="70-thermaltake-lcd.rules"
+OLD_RULE="/etc/udev/rules.d/99-thermaltake-lcd.rules"
+
+have() { command -v "$1" &>/dev/null; }
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+user_systemd() { systemctl --user show-environment &>/dev/null; }
+
 # ── Detect distro ──────────────────────────────────────────────────────────────
 
-detect_pkg_manager() {
-    if command -v pacman &>/dev/null;  then echo "pacman"
-    elif command -v apt-get &>/dev/null; then echo "apt"
-    elif command -v dnf &>/dev/null;   then echo "dnf"
-    elif command -v zypper &>/dev/null; then echo "zypper"
-    else echo "unknown"
+detect_distro() {
+    local id="" like=""
+    if [ -r /etc/os-release ]; then
+        # shellcheck source=/dev/null
+        id=$(. /etc/os-release && echo "${ID:-}")
+        # shellcheck source=/dev/null
+        like=$(. /etc/os-release && echo "${ID_LIKE:-}")
     fi
+    if have rpm-ostree && [ -e /run/ostree-booted ]; then echo "ostree"; return; fi
+    case " $id $like " in
+        *" arch "*)                       echo "arch" ;;
+        *" debian "*|*" ubuntu "*)        echo "debian" ;;
+        *" fedora "*|*" rhel "*)          echo "fedora" ;;
+        *" suse "*|*" opensuse "*)        echo "suse" ;;
+        *)                                echo "unknown" ;;
+    esac
 }
 
 install_deps() {
-    local pm
-    pm=$(detect_pkg_manager)
-    info "Detected package manager: $pm"
+    local distro
+    distro=$(detect_distro)
+    info "Detected distro family: $distro"
 
-    case "$pm" in
-        pacman)
-            info "Installing dependencies (pacman)..."
-            sudo pacman -S --needed --noconfirm \
-                libusb python-pillow zenity \
-                rust cargo
+    case "$distro" in
+        arch)
+            local pkgs=(base-devel libusb pkgconf python-pillow zenity)
+            # 'rust' conflicts with 'rustup'; only add it when no toolchain exists.
+            have cargo || pkgs+=(rust)
+            sudo pacman -S --needed --noconfirm "${pkgs[@]}"
             ;;
-        apt)
-            info "Installing dependencies (apt)..."
+        debian)
+            # Distro Rust is usually too old; check_rust installs rustup if needed.
             sudo apt-get update -qq
-            sudo apt-get install -y \
-                libusb-1.0-0 libusb-1.0-0-dev \
-                python3-pil \
-                zenity \
-                cargo rustc
+            sudo apt-get install -y build-essential pkg-config curl libusb-1.0-0-dev python3-pil zenity
             ;;
-        dnf)
-            info "Installing dependencies (dnf)..."
-            sudo dnf install -y \
-                libusbx libusbx-devel \
-                python3-pillow \
-                zenity \
-                cargo rust
+        fedora)
+            sudo dnf install -y gcc pkgconf-pkg-config curl libusb1-devel python3-pillow zenity cargo rust
             ;;
-        zypper)
-            info "Installing dependencies (zypper)..."
-            sudo zypper install -y \
-                libusb-1_0-0 libusb-1_0-devel \
-                python3-Pillow \
-                zenity \
-                cargo rust
+        suse)
+            sudo zypper install -y gcc pkg-config curl libusb-1_0-devel python3-Pillow zenity
+            ;;
+        ostree)
+            warn "Immutable system (rpm-ostree) detected. Layer the dependencies first, then re-run:"
+            warn "  rpm-ostree install libusb1-devel python3-pillow zenity gcc && systemctl reboot"
+            have pkg-config && python3 -c 'import PIL' 2>/dev/null || error "Dependencies missing."
             ;;
         *)
-            warn "Unknown package manager. Please install manually:"
-            warn "  - libusb"
-            warn "  - python3-pillow (Pillow)"
-            warn "  - zenity (optional, for file picker)"
-            warn "  - rust / cargo"
-            warn "Continuing..."
+            warn "Unknown distro. Make sure these are installed, then re-run:"
+            warn "  C compiler, pkg-config, libusb-1.0 (dev headers), python3, Pillow, zenity, curl"
             ;;
     esac
 }
@@ -73,124 +84,155 @@ install_deps() {
 # ── Check Rust ─────────────────────────────────────────────────────────────────
 
 check_rust() {
-    if ! command -v cargo &>/dev/null; then
-        warn "cargo not found. Installing via rustup..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+    # shellcheck source=/dev/null
+    [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+    local have_ver=""
+    have rustc && have_ver=$(rustc --version | awk '{print $2}')
+
+    if [ -n "$have_ver" ] && version_ge "$have_ver" "$MIN_RUST"; then
+        ok "Rust $have_ver"
+        return
+    fi
+
+    if have rustup; then
+        warn "Rust ${have_ver:-not found} is older than $MIN_RUST; installing the stable toolchain via rustup..."
+        rustup toolchain install stable --profile minimal
+    else
+        warn "Rust ${have_ver:-not found} is older than $MIN_RUST."
+        info "Installing a user-local toolchain with rustup (https://rustup.rs) into ~/.cargo ..."
+        have curl || error "curl is required to install rustup"
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
         # shellcheck source=/dev/null
         source "$HOME/.cargo/env"
     fi
-    ok "Rust $(rustc --version)"
+    export RUSTUP_TOOLCHAIN=stable
+    ok "$(rustc --version)"
 }
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
 build() {
     info "Building (release)..."
-    cargo build --release
+    cargo build --release --locked --bin th-linux-lcd
     ok "Build complete: $(du -sh target/release/th-linux-lcd | cut -f1) binary"
 }
 
 # ── Install binary ─────────────────────────────────────────────────────────────
 
 install_binary() {
-    local dest="$HOME/.local/bin/th-linux-lcd"
-    mkdir -p "$HOME/.local/bin"
+    local dest="$BIN_DIR/th-linux-lcd"
+    mkdir -p "$BIN_DIR"
 
     # Atomic replace so a running instance is not interrupted
-    cp target/release/th-linux-lcd "$dest.new"
-    mv "$dest.new" "$dest"
-    chmod +x "$dest"
+    install -m755 target/release/th-linux-lcd "$dest.new"
+    mv -f "$dest.new" "$dest"
     ok "Binary installed to $dest"
 
-    # Warn if ~/.local/bin is not in PATH
-    if ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
-        warn "~/.local/bin is not in your PATH."
-        warn "Add this to your shell profile:"
-        warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-    fi
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *)
+            warn "~/.local/bin is not in your PATH. Add this to your shell profile:"
+            warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            ;;
+    esac
 }
 
 # ── systemd user service ───────────────────────────────────────────────────────
 
 install_service() {
-    local svc_dir="$HOME/.config/systemd/user"
-    mkdir -p "$svc_dir"
-    cp th-linux-lcd.service "$svc_dir/"
-    systemctl --user daemon-reload
-    systemctl --user enable th-linux-lcd
-    ok "Systemd user service installed and enabled"
+    mkdir -p "$SVC_DIR"
+    sed 's|^ExecStart=/usr/bin/|ExecStart=%h/.local/bin/|' th-linux-lcd.service > "$SVC_DIR/th-linux-lcd.service"
+    if user_systemd; then
+        systemctl --user daemon-reload
+        systemctl --user enable th-linux-lcd
+        # Restart so an upgrade picks up the new binary (waits for any flash write to finish).
+        systemctl --user restart th-linux-lcd
+        ok "Daemon service installed, enabled and started"
+    else
+        warn "No systemd user session (SSH/TTY?). After logging in graphically run:"
+        warn "  systemctl --user enable --now th-linux-lcd"
+    fi
 }
 
-# ── Desktop entry ──────────────────────────────────────────────────────────────
+# ── Desktop entry + icon ───────────────────────────────────────────────────────
 
 install_desktop() {
-    local apps_dir="$HOME/.local/share/applications"
-    mkdir -p "$apps_dir"
-    cp pkg/th-linux-lcd.desktop "$apps_dir/"
-    if command -v update-desktop-database &>/dev/null; then
-        update-desktop-database "$apps_dir" 2>/dev/null || true
+    mkdir -p "$APPS_DIR" "$ICON_DIR"
+    install -m644 pkg/th-linux-lcd.svg "$ICON_DIR/th-linux-lcd.svg"
+    local exec_path="$BIN_DIR/th-linux-lcd"
+    exec_path=${exec_path//\\/\\\\}
+    exec_path=${exec_path//&/\\&}
+    exec_path=${exec_path//|/\\|}
+    sed "s|^Exec=th-linux-lcd|Exec=\"$exec_path\"|" pkg/th-linux-lcd.desktop > "$APPS_DIR/th-linux-lcd.desktop"
+    if have update-desktop-database; then
+        update-desktop-database "$APPS_DIR" 2>/dev/null || true
     fi
     ok "Desktop entry installed"
 }
 
-# ── udev rules (USB permissions) ──────────────────────────────────────────────
+# ── udev rule (USB permissions) ────────────────────────────────────────────────
 
 install_udev() {
-    local rules_src="pkg/99-thermaltake-lcd.rules"
-    local rules_dst="/etc/udev/rules.d/99-thermaltake-lcd.rules"
-
-    if [ ! -f "$rules_src" ]; then
-        warn "udev rules file not found, skipping"
-        return
-    fi
-
-    info "Installing udev rules (requires sudo)..."
-    sudo cp "$rules_src" "$rules_dst"
+    info "Installing udev rule (requires sudo)..."
+    sudo install -Dm644 "pkg/$RULE_NAME" "/etc/udev/rules.d/$RULE_NAME"
+    sudo rm -f "$OLD_RULE"
     sudo udevadm control --reload-rules
-    sudo udevadm trigger
-    ok "udev rules installed: $rules_dst"
+    sudo udevadm trigger --action=change --subsystem-match=usb --attr-match=idVendor=264a
+    sudo udevadm settle || true
+    ok "udev rule installed (access is granted to the logged-in user; no group or re-login needed)"
+}
 
-    # Add user to plugdev if needed
-    if ! groups | grep -q plugdev; then
-        info "Adding $USER to plugdev group..."
-        sudo usermod -aG plugdev "$USER"
-        warn "Group membership takes effect on next login."
-        warn "You may need to log out and back in before the device is accessible."
-    else
-        ok "User $USER is already in plugdev"
+# ── Uninstall ──────────────────────────────────────────────────────────────────
+
+uninstall() {
+    info "Uninstalling th-linux-lcd..."
+    if user_systemd; then
+        systemctl --user disable --now th-linux-lcd 2>/dev/null || true
     fi
+    rm -f "$BIN_DIR/th-linux-lcd" "$SVC_DIR/th-linux-lcd.service" \
+          "$APPS_DIR/th-linux-lcd.desktop" "$ICON_DIR/th-linux-lcd.svg"
+    user_systemd && systemctl --user daemon-reload || true
+    sudo rm -f "/etc/udev/rules.d/$RULE_NAME" "$OLD_RULE"
+    sudo udevadm control --reload-rules
+    ok "Uninstalled. Your library is kept in ~/.local/share/th-linux-lcd (delete it manually if you want)."
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 main() {
+    [ "$(id -u)" -eq 0 ] && error "Do not run as root. Run as your normal user; sudo is used where needed."
+    cd "$(dirname "$(readlink -f "$0")")"
+    [ -f Cargo.toml ] && [ -f th-linux-lcd.service ] || error "Run this script from the th-linux-lcd repository."
+
+    case "${1:-}" in
+        --uninstall) uninstall; return ;;
+        "") ;;
+        *) error "Unknown option: $1 (use --uninstall to remove)" ;;
+    esac
+
     echo ""
     echo "  th-linux-lcd installer"
     echo "  ────────────────────────────────────"
+    echo "  This asks for your sudo password to install packages and a udev rule."
     echo ""
-
-    # Must be run from the repo root
-    if [ ! -f "Cargo.toml" ]; then
-        error "Run this script from the repository root directory."
-    fi
 
     install_deps
     check_rust
     build
     install_binary
-    install_service
     install_desktop
     install_udev
+    install_service
 
     echo ""
     ok "Installation complete."
     echo ""
-    echo "  Start the daemon:    systemctl --user start th-linux-lcd"
-    echo "  Launch the GUI:      th-linux-lcd"
-    echo "  Check daemon status: systemctl --user status th-linux-lcd"
+    echo "  Launch the GUI:      th-linux-lcd   (or find \"TH Linux LCD\" in your app menu)"
+    echo "  Daemon status:       systemctl --user status th-linux-lcd"
+    echo "  Daemon logs:         journalctl --user -u th-linux-lcd -f"
+    echo "  Uninstall:           bash install.sh --uninstall"
     echo ""
-    echo "  If the device is not detected, ensure the udev rule is loaded"
-    echo "  and you have logged out and back in after being added to plugdev."
+    echo "  If the GUI shows NO DEVICE, unplug and re-plug the cooler's USB cable."
     echo ""
 }
 

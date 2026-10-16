@@ -1,24 +1,17 @@
 post_install() {
-    echo "==> Reloading udev rules..."
-    udevadm control --reload-rules
-    udevadm trigger
-
-    echo ""
-    echo "==> Add your user to the 'plugdev' group for non-root USB access:"
-    echo "      sudo usermod -aG plugdev \$USER"
-    echo "    Then log out and back in."
-    echo ""
-    echo "==> To enable the background daemon (recommended):"
+    echo "==> USB access is granted automatically to the user logged in at the seat"
+    echo "    (udev uaccess). Re-plug the cooler's USB cable if it was already connected."
+    echo "==> Enable the background daemon for your user:"
     echo "      systemctl --user enable --now th-linux-lcd"
-    echo ""
-    echo "==> Or just launch the app — it will start the daemon automatically."
+    echo "    Or just launch the app; it starts the daemon automatically."
 }
 
 post_upgrade() {
-    post_install
+    echo "==> Restart the daemon to use the new version:"
+    echo "      systemctl --user restart th-linux-lcd"
 }
 
 pre_remove() {
-    echo "==> Stopping and disabling th-linux-lcd daemon..."
-    systemctl --user disable --now th-linux-lcd 2>/dev/null || true
+    echo "==> Each user who enabled the daemon should run:"
+    echo "      systemctl --user disable --now th-linux-lcd"
 }

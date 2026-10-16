@@ -1,3 +1,4 @@
 # Thermaltake TH420V2 Ultra LCD (VID 0x264a, PID 0x233c)
-# Allow access to members of the 'plugdev' group without root.
-SUBSYSTEM=="usb", ATTRS{idVendor}=="264a", ATTRS{idProduct}=="233c", MODE="0660", GROUP="plugdev"
+# Grant access to the user logged in at the local seat (systemd-logind "uaccess").
+# Must sort before 73-seat-late.rules, which applies the uaccess ACL — hence "70-".
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="264a", ATTR{idProduct}=="233c", MODE="0660", TAG+="uaccess"

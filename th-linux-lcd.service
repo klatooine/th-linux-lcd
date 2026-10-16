@@ -1,13 +1,20 @@
 [Unit]
-Description=Thermaltake TH LCD Daemon
-After=graphical-session.target
+Description=Thermaltake TH LCD daemon
+Documentation=https://github.com/klatooine/th-linux-lcd
 
 [Service]
 Type=simple
-ExecStartPre=/bin/sleep 3
-ExecStart=%h/.local/bin/th-linux-lcd --daemon
+ExecStart=/usr/bin/th-linux-lcd --daemon
 Restart=on-failure
 RestartSec=5
+# Let an in-progress flash write (upload + ~30 s settle) finish on stop.
+TimeoutStopSec=120
+NoNewPrivileges=yes
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=default.target
