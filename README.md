@@ -26,6 +26,7 @@ Replaces the official Windows-only software with a lightweight Rust desktop appl
 | **Rotation** | Rotate any animation or boot image by 90 / 180 / 270° |
 | **Gallery** | Per-category gallery with circle preview and thumbnail grid |
 | **Autoplay** | The last streamed animation resumes when the daemon starts |
+| **Tray icon** | Status at a glance; click to open the app while the daemon keeps running |
 
 ---
 
@@ -58,6 +59,7 @@ The installer asks for your sudo password and then:
 - Installs the binary to `~/.local/bin/`, plus a desktop entry and icon
 - Installs a udev rule that grants USB access to the user logged in at the seat (no group membership or re-login needed)
 - Installs, enables and starts the systemd user service
+- Starts the tray icon and adds it to your session autostart
 
 Re-run it to upgrade. If the GUI shows **NO DEVICE** right after installing, unplug and re-plug the cooler's USB cable.
 
@@ -76,7 +78,7 @@ systemctl --user enable --now th-linux-lcd
 bash install.sh --uninstall
 ```
 
-This removes the binary, service, desktop entry and udev rule. Your library in `~/.local/share/th-linux-lcd/` is kept.
+This removes the binary, service, tray autostart entry, desktop entry and udev rule. Your library in `~/.local/share/th-linux-lcd/` is kept.
 
 ### Manual dependency install
 
@@ -137,6 +139,14 @@ Daemon logs: `journalctl --user -u th-linux-lcd -f`
 
 Use the **ON** / **OFF** buttons in the header to control the LCD backlight.
 
+### Tray icon
+
+`th-linux-lcd --tray` puts an icon in your system tray (started automatically at login by the installer). Its colour shows the daemon status — green streaming, amber idle or writing flash, orange no device, red daemon not running. Click it to open the app; the menu also has **Stop streaming**, **Screen on/off** and **Quit tray icon**.
+
+Closing the window does not stop streaming — the daemon keeps running, and the tray icon reopens the window. Launching the app while it is already open brings the existing window forward instead of opening a second one (on Wayland the compositor may only highlight it).
+
+The tray uses the freedesktop StatusNotifierItem protocol: supported by KDE Plasma, waybar, XFCE, Cinnamon, MATE and others. On GNOME install the *AppIndicator and KStatusNotifierItem Support* extension. To stop it starting at login, remove `~/.config/autostart/th-linux-lcd-tray.desktop` (or disable it in your desktop's autostart settings).
+
 ---
 
 ## Safety
@@ -175,7 +185,7 @@ What you should do:
                               └─────────────────────────────────────────┘
 ```
 
-The GUI and daemon are a **single binary**. The GUI starts the daemon automatically (via the systemd user service when installed). IPC uses newline-delimited JSON over a Unix domain socket that only your user can access.
+The GUI, daemon and tray icon are a **single binary** (`th-linux-lcd`, `--daemon`, `--tray`). The GUI starts the daemon automatically (via the systemd user service when installed). IPC uses newline-delimited JSON over a Unix domain socket that only your user can access.
 
 See [docs/architecture.md](docs/architecture.md) for a detailed breakdown.
 

@@ -4,6 +4,8 @@ post_install() {
     echo "==> Enable the background daemon for your user:"
     echo "      systemctl --user enable --now th-linux-lcd"
     echo "    Or just launch the app; it starts the daemon automatically."
+    echo "==> The tray icon starts at your next login. To start it now:"
+    echo "      th-linux-lcd --tray &"
 }
 
 post_upgrade() {

@@ -455,25 +455,17 @@ pub fn run() -> i32 {
     eprintln!("[daemon] starting (PID {})", std::process::id());
 
     // Single instance: hold an exclusive lock for the lifetime of the process.
-    let lock_path = shared::lock_path();
-    let lock = match File::options().create(true).truncate(false).write(true).open(&lock_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[daemon] cannot open {}: {e}", lock_path.display());
-            return 1;
-        }
-    };
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(fs::TryLockError::WouldBlock) => {
+    let lock = match shared::lock_instance(shared::DAEMON_LOCK) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
             eprintln!("[daemon] another daemon is already running");
             return 0;
         }
-        Err(fs::TryLockError::Error(e)) => {
-            eprintln!("[daemon] cannot lock {}: {e}", lock_path.display());
+        Err(e) => {
+            eprintln!("[daemon] {e}");
             return 1;
         }
-    }
+    };
 
     // We hold the lock, so any existing socket is stale.
     let sock_path = shared::socket_path();

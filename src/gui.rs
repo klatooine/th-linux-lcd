@@ -2,12 +2,16 @@ use eframe::egui;
 use egui::{Color32, FontId, Pos2, RichText, Stroke, TextureHandle, TextureOptions, Vec2};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use th_linux_lcd::import;
 use th_linux_lcd::shared::{
@@ -121,6 +125,7 @@ pub struct App {
     daemon_connected: bool,
     daemon_child: Option<Child>,
     confirm: Option<PendingUpload>,
+    instance: GuiInstance,
 }
 
 fn daemon_reachable() -> bool {
@@ -202,9 +207,85 @@ fn import_boot_task(data: &Path) -> Result<Option<BootAnim>, String> {
     }))
 }
 
+// ── Single instance ───────────────────────────────────────────────────────────
+
+/// Single-instance guard for the GUI. A second launch (from the tray or the
+/// app menu) asks the running window to come forward and then exits.
+struct GuiInstance {
+    _lock: Option<std::fs::File>,
+    show_requested: Arc<AtomicBool>,
+    ctx: Arc<OnceLock<egui::Context>>,
+    socket: Option<PathBuf>,
+}
+
+fn request_show(sock: &Path) -> bool {
+    UnixStream::connect(sock).and_then(|mut s| s.write_all(b"show\n")).is_ok()
+}
+
+impl GuiInstance {
+    /// Returns `None` if another GUI is running (it has been asked to show itself).
+    fn acquire() -> Option<Self> {
+        let sock = shared::gui_socket_path();
+        for _ in 0..20 {
+            if request_show(&sock) {
+                return None;
+            }
+            match shared::lock_instance(shared::GUI_LOCK) {
+                Ok(Some(lock)) => return Some(Self::listen(Some(lock), sock)),
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)), // another GUI is starting
+                Err(e) => {
+                    eprintln!("[gui] {e}; running without single-instance support");
+                    return Some(Self::listen(None, sock));
+                }
+            }
+        }
+        None
+    }
+
+    fn listen(lock: Option<std::fs::File>, sock: PathBuf) -> Self {
+        let show_requested = Arc::new(AtomicBool::new(false));
+        let ctx: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
+        let mut socket = None;
+        if lock.is_some() {
+            // We hold the lock, so any existing socket is stale.
+            let _ = std::fs::remove_file(&sock);
+            match UnixListener::bind(&sock) {
+                Ok(listener) => {
+                    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+                    let (flag, ctx) = (Arc::clone(&show_requested), Arc::clone(&ctx));
+                    std::thread::spawn(move || {
+                        for mut conn in listener.incoming().flatten() {
+                            let mut buf = [0u8; 16];
+                            let _ = conn.set_read_timeout(Some(Duration::from_secs(1)));
+                            if conn.read(&mut buf).is_ok_and(|n| buf[..n].starts_with(b"show")) {
+                                flag.store(true, Ordering::Relaxed);
+                                if let Some(ctx) = ctx.get() {
+                                    ctx.request_repaint();
+                                }
+                            }
+                        }
+                    });
+                    socket = Some(sock);
+                }
+                Err(e) => eprintln!("[gui] cannot bind {}: {e}", sock.display()),
+            }
+        }
+        Self { _lock: lock, show_requested, ctx, socket }
+    }
+}
+
+impl Drop for GuiInstance {
+    fn drop(&mut self) {
+        if let Some(sock) = &self.socket {
+            let _ = std::fs::remove_file(sock);
+        }
+    }
+}
+
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, instance: GuiInstance) -> Self {
         setup_theme(&cc.egui_ctx);
+        let _ = instance.ctx.set(cc.egui_ctx.clone());
         let data = shared::data_dir();
         let (videos, e1) = shared::load_videos(&data);
         let (standby, e2) = shared::load_standby(&data);
@@ -232,6 +313,7 @@ impl App {
             daemon_connected: false,
             daemon_child: None,
             confirm: None,
+            instance,
         };
 
         app.ensure_daemon();
@@ -784,6 +866,12 @@ fn section_header(ui: &mut egui::Ui, title: &str, button: &str, enabled: bool) -
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.instance.show_requested.swap(false, Ordering::Relaxed) {
+            // Best effort: Wayland compositors may only highlight the window instead.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
         self.poll_bg();
         self.poll_status();
         ctx.request_repaint_after(if self.bg_task.is_some() { Duration::from_millis(200) } else { STATUS_POLL });
@@ -1270,6 +1358,10 @@ impl App {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub fn run() {
+    let Some(instance) = GuiInstance::acquire() else {
+        eprintln!("th-linux-lcd: already running; brought the existing window forward");
+        return;
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("TH Linux LCD")
@@ -1279,7 +1371,7 @@ pub fn run() {
             .with_resizable(true),
         ..Default::default()
     };
-    if let Err(e) = eframe::run_native("TH Linux LCD", options, Box::new(|cc| Ok(Box::new(App::new(cc))))) {
+    if let Err(e) = eframe::run_native("TH Linux LCD", options, Box::new(|cc| Ok(Box::new(App::new(cc, instance))))) {
         eprintln!("th-linux-lcd: cannot start the GUI: {e}");
         std::process::exit(1);
     }

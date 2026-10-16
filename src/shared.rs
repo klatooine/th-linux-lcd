@@ -65,8 +65,30 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("th-lcd.sock")
 }
 
-pub fn lock_path() -> PathBuf {
-    runtime_dir().join("th-lcd.lock")
+/// Socket a running GUI listens on so a second launch can bring it forward.
+pub fn gui_socket_path() -> PathBuf {
+    runtime_dir().join("th-lcd-gui.sock")
+}
+
+pub const DAEMON_LOCK: &str = "th-lcd.lock";
+pub const GUI_LOCK: &str = "th-lcd-gui.lock";
+pub const TRAY_LOCK: &str = "th-lcd-tray.lock";
+
+/// Take the per-user single-instance lock `name` (in the runtime dir) for the
+/// lifetime of the returned file. `Ok(None)` if another process holds it.
+pub fn lock_instance(name: &str) -> Result<Option<fs::File>, String> {
+    let path = runtime_dir().join(name);
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
 }
 
 pub fn data_dir() -> PathBuf {

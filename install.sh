@@ -19,6 +19,7 @@ BIN_DIR="$HOME/.local/bin"
 SVC_DIR="$HOME/.config/systemd/user"
 APPS_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 RULE_NAME="70-thermaltake-lcd.rules"
 OLD_RULE="/etc/udev/rules.d/99-thermaltake-lcd.rules"
 
@@ -170,6 +171,40 @@ install_desktop() {
     ok "Desktop entry installed"
 }
 
+# ── Tray icon (XDG autostart) ──────────────────────────────────────────────────
+
+install_tray() {
+    mkdir -p "$AUTOSTART_DIR"
+    local exec_path="$BIN_DIR/th-linux-lcd"
+    exec_path=${exec_path//\\/\\\\}
+    exec_path=${exec_path//&/\\&}
+    exec_path=${exec_path//|/\\|}
+    sed "s|^Exec=th-linux-lcd|Exec=\"$exec_path\"|" pkg/th-linux-lcd-tray.desktop > "$AUTOSTART_DIR/th-linux-lcd-tray.desktop"
+    ok "Tray icon will start at login (remove $AUTOSTART_DIR/th-linux-lcd-tray.desktop to disable)"
+
+    # (Re)start it now so an upgrade picks up the new binary.
+    restart_tray
+}
+
+# Stop only our tray process (never the daemon or GUI).
+stop_tray() {
+    local pid
+    for pid in $(pgrep -u "$(id -u)" -x th-linux-lcd || true); do
+        if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q -- ' --tray'; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+restart_tray() {
+    stop_tray
+    if [ -n "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ] && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        sleep 0.5
+        setsid -f "$BIN_DIR/th-linux-lcd" --tray </dev/null >/dev/null 2>&1 || true
+        ok "Tray icon started"
+    fi
+}
+
 # ── udev rule (USB permissions) ────────────────────────────────────────────────
 
 install_udev() {
@@ -189,8 +224,10 @@ uninstall() {
     if user_systemd; then
         systemctl --user disable --now th-linux-lcd 2>/dev/null || true
     fi
+    stop_tray
     rm -f "$BIN_DIR/th-linux-lcd" "$SVC_DIR/th-linux-lcd.service" \
-          "$APPS_DIR/th-linux-lcd.desktop" "$ICON_DIR/th-linux-lcd.svg"
+          "$APPS_DIR/th-linux-lcd.desktop" "$ICON_DIR/th-linux-lcd.svg" \
+          "$AUTOSTART_DIR/th-linux-lcd-tray.desktop"
     user_systemd && systemctl --user daemon-reload || true
     sudo rm -f "/etc/udev/rules.d/$RULE_NAME" "$OLD_RULE"
     sudo udevadm control --reload-rules
@@ -223,11 +260,12 @@ main() {
     install_desktop
     install_udev
     install_service
+    install_tray
 
     echo ""
     ok "Installation complete."
     echo ""
-    echo "  Launch the GUI:      th-linux-lcd   (or find \"TH Linux LCD\" in your app menu)"
+    echo "  Launch the GUI:      th-linux-lcd   (or click the tray icon / find \"TH Linux LCD\" in your app menu)"
     echo "  Daemon status:       systemctl --user status th-linux-lcd"
     echo "  Daemon logs:         journalctl --user -u th-linux-lcd -f"
     echo "  Uninstall:           bash install.sh --uninstall"

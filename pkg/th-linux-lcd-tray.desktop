@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=TH Linux LCD (tray)
+Comment=Tray icon for the Thermaltake TH420V2 Ultra LCD controller
+Exec=th-linux-lcd --tray
+Icon=th-linux-lcd
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

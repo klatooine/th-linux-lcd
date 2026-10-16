@@ -8,6 +8,9 @@
 |------|---------|------|
 | GUI | `th-linux-lcd` | Renders the UI, sends commands over Unix socket |
 | Daemon | `th-linux-lcd --daemon` | Owns the USB device, streams frames, handles uploads |
+| Tray | `th-linux-lcd --tray` | StatusNotifierItem icon: shows status, opens the GUI, quick actions |
+
+Each mode is single-instance per user, enforced with a lock file in `$XDG_RUNTIME_DIR` (`th-lcd.lock`, `th-lcd-gui.lock`, `th-lcd-tray.lock`). A second GUI launch connects to `th-lcd-gui.sock`, asks the running window to come forward, and exits. The tray polls the daemon's `Status` every 2 s and never touches USB itself.
 
 The GUI starts the daemon on startup if it is not reachable — via `systemctl --user start th-linux-lcd` when the service is installed, otherwise by spawning `th-linux-lcd --daemon`. Only one daemon can run per user: it holds an exclusive lock on `$XDG_RUNTIME_DIR/th-lcd.lock`.
 
@@ -128,7 +131,8 @@ Imports (file picker + Pillow), rotation re-encoding and uploads run on a backgr
 |------|---------------|
 | `src/main.rs` | Entry point — routes to `daemon::run()` or `gui::run()` |
 | `src/daemon.rs` | Unix socket server, validation, USB thread (streaming, uploads, reconnect) |
-| `src/gui.rs` | egui UI: all three tabs, gallery, circle preview, background tasks |
+| `src/gui.rs` | egui UI: all three tabs, gallery, circle preview, background tasks, single-instance guard |
+| `src/tray.rs` | System tray icon (`ksni`, D-Bus StatusNotifierItem) |
 | `src/lib.rs` | Library crate shared by the app and the example |
 | `src/usb.rs` | Low-level USB protocol: open, send_frame, set_screen, upload |
 | `src/shared.rs` | IPC types, data model, atomic persistence, boot container build/validate, unit tests |
