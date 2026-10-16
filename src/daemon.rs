@@ -1,309 +1,532 @@
-use crate::shared::{self, socket_path, Cmd, DaemonStatus, Resp};
-use crate::usb;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
+//! Background daemon: owns the USB device, streams frames, performs uploads,
+//! and serves newline-delimited JSON commands on a Unix socket.
+
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// ── USB thread ────────────────────────────────────────────────────────────────
+use th_linux_lcd::shared::{self, Cmd, DaemonStatus, Resp};
+use th_linux_lcd::usb;
 
-struct UsbState {
-    playing: bool,
-    frames: Vec<Vec<u8>>,
-    frame_idx: usize,
-    fps: f32,
-    playing_id: Option<String>,
-    next_frame: Instant,
-    autoplay_restored: bool,
-}
+const DEVICE_RETRY: Duration = Duration::from_secs(2);
+const PRESENCE_CHECK: Duration = Duration::from_secs(5);
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_CONNECTIONS: usize = 16;
+const CONN_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const QUICK_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// An upload that could not start within this time is dropped rather than
+/// written to flash long after the user asked for it.
+const UPLOAD_START_DEADLINE: Duration = Duration::from_secs(10);
+const QUEUE_DEPTH: usize = 32;
 
-impl Default for UsbState {
-    fn default() -> Self {
-        Self {
-            playing: false,
-            frames: Vec::new(),
-            frame_idx: 0,
-            fps: 15.0,
-            playing_id: None,
-            next_frame: Instant::now(),
-            autoplay_restored: false,
-        }
-    }
-}
+static QUIT: AtomicBool = AtomicBool::new(false);
 
-pub enum UsbCmd {
-    Play { frames_dir: String, fps: f32, frame_count: usize, id: String },
+type Reply = SyncSender<Result<(), String>>;
+
+enum UsbCmd {
+    Play { frames: Vec<Vec<u8>>, fps: f32, id: String },
     Stop,
-    ScreenOn,
-    ScreenOff,
-    UploadStandby { path: String, done_tx: std::sync::mpsc::SyncSender<Result<(), String>> },
-    UploadBoot    { path: String, done_tx: std::sync::mpsc::SyncSender<Result<(), String>> },
+    Screen(bool),
+    Upload { slot: usb::Slot, data: Vec<u8>, deadline: Instant },
     Quit,
 }
 
-fn load_frames(dir: &str, count: usize) -> Vec<Vec<u8>> {
-    (1..=count)
-        .filter_map(|i| fs::read(format!("{}/f{:05}.jpg", dir, i)).ok())
+type Job = (UsbCmd, Option<Reply>);
+
+/// Read a regular file, refusing anything larger than `max` bytes.
+fn read_limited(path: &Path, max: usize) -> Result<Vec<u8>, String> {
+    let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let meta = f.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.len() > max as u64 {
+        return Err(format!("{} is {} bytes; the limit is {max}", path.display(), meta.len()));
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(max as u64 + 1).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > max {
+        return Err(format!("{} grew past the {max}-byte limit", path.display()));
+    }
+    Ok(buf)
+}
+
+fn load_frames(dir: &Path, count: usize) -> Vec<Vec<u8>> {
+    (1..=count.min(shared::MAX_STREAM_FRAMES))
+        .filter_map(|i| read_limited(&shared::frame_file(dir, i), usb::MAX_FRAME_BYTES).ok())
+        .filter(|f| !f.is_empty())
         .collect()
 }
 
-fn usb_thread(
-    rx: std::sync::mpsc::Receiver<UsbCmd>,
+// ── USB thread ────────────────────────────────────────────────────────────────
+
+struct Stream {
+    frames: Vec<Vec<u8>>,
+    idx: usize,
+    period: Duration,
+    next: Instant,
+    fps: f32,
+    id: String,
+}
+
+impl Stream {
+    fn new(frames: Vec<Vec<u8>>, fps: f32, id: String) -> Self {
+        Self { frames, idx: 0, period: Duration::from_secs_f32(1.0 / fps), next: Instant::now(), fps, id }
+    }
+}
+
+struct FlashSettle {
+    until: Instant,
+    reply: Option<Reply>,
+}
+
+struct UsbThread {
+    rx: Receiver<Job>,
     status: Arc<Mutex<DaemonStatus>>,
-) {
-    let mut state = UsbState::default();
-    let mut device: Option<rusb::DeviceHandle<rusb::GlobalContext>> = None;
+    published: DaemonStatus,
+    device: Option<usb::Handle>,
+    last_open_attempt: Option<Instant>,
+    last_presence_check: Instant,
+    last_open_error: Option<String>,
+    stream: Option<Stream>,
+    autoplay_checked: bool,
+    settle: Option<FlashSettle>,
+    quitting: bool,
+}
 
-    loop {
-        // Try to open device if we don't have one
-        if device.is_none() {
-            device = usb::open();
-            let found = device.is_some();
-            if let Ok(mut s) = status.lock() {
-                s.device_found = found;
-            }
-            if device.is_none() {
-                std::thread::sleep(Duration::from_secs(2));
-                continue;
-            }
-            // Device just opened — restore autoplay if set and not yet started
-            if !state.autoplay_restored {
-                state.autoplay_restored = true;
-                let data = shared::data_dir();
-                if let Some(id) = shared::load_autoplay(&data) {
-                    let videos = shared::load_videos(&data);
-                    if let Some(v) = videos.iter().find(|v| v.id == id) {
-                        let base = shared::frames_dir(&data, &v.id);
-                        let frames_dir = if v.rotation != 0 {
-                            base.with_file_name(format!("{}-rotated", v.id))
-                        } else {
-                            base
-                        };
-                        let frames = load_frames(frames_dir.to_str().unwrap_or(""), v.frame_count);
-                        if !frames.is_empty() {
-                            eprintln!("[daemon] autoplay: {} ({} frames @ {}fps)", v.name, frames.len(), v.fps);
-                            state.frames = frames;
-                            state.fps = v.fps;
-                            state.frame_idx = 0;
-                            state.playing = true;
-                            state.playing_id = Some(v.id.clone());
-                            state.next_frame = Instant::now();
-                        }
-                    }
-                }
-            }
+impl UsbThread {
+    fn new(rx: Receiver<Job>, status: Arc<Mutex<DaemonStatus>>) -> Self {
+        Self {
+            rx,
+            status,
+            published: DaemonStatus::default(),
+            device: None,
+            last_open_attempt: None,
+            last_presence_check: Instant::now(),
+            last_open_error: None,
+            stream: None,
+            autoplay_checked: false,
+            settle: None,
+            quitting: false,
         }
+    }
 
-        // Drain all pending commands (non-blocking)
+    fn run(mut self) {
         loop {
-            match rx.try_recv() {
-                Ok(cmd) => match cmd {
-                    UsbCmd::Play { frames_dir, fps, frame_count, id } => {
-                        state.frames = load_frames(&frames_dir, frame_count);
-                        state.fps = fps;
-                        state.frame_idx = 0;
-                        state.playing = true;
-                        state.playing_id = Some(id.clone());
-                        state.next_frame = Instant::now();
-                        shared::save_autoplay(&shared::data_dir(), Some(&id));
-                        eprintln!("[daemon] play: {} frames @ {}fps", state.frames.len(), fps);
-                    }
-                    UsbCmd::Stop => {
-                        state.playing = false;
-                        state.playing_id = None;
-                        state.frames.clear();
-                        shared::save_autoplay(&shared::data_dir(), None);
-                        eprintln!("[daemon] stop");
-                    }
-                    UsbCmd::ScreenOn => {
-                        if let Some(ref dev) = device {
-                            usb::screen_on(dev);
-                        }
-                    }
-                    UsbCmd::ScreenOff => {
-                        if let Some(ref dev) = device {
-                            usb::screen_off(dev);
-                        }
-                    }
-                    UsbCmd::UploadStandby { path, done_tx } => {
-                        let was_playing = state.playing;
-                        state.playing = false;
-                        let result = if let Some(ref dev) = device {
-                            fs::read(&path)
-                                .map_err(|e| e.to_string())
-                                .and_then(|data| usb::upload_standby(dev, &data))
-                        } else {
-                            Err("Device not found".into())
-                        };
-                        let _ = done_tx.send(result);
-                        state.playing = was_playing;
-                    }
-                    UsbCmd::UploadBoot { path, done_tx } => {
-                        let was_playing = state.playing;
-                        state.playing = false;
-                        let result = if let Some(ref dev) = device {
-                            fs::read(&path)
-                                .map_err(|e| e.to_string())
-                                .and_then(|data| usb::upload_boot_animation(dev, &data))
-                        } else {
-                            Err("Device not found".into())
-                        };
-                        let _ = done_tx.send(result);
-                        state.playing = was_playing;
-                    }
-                    UsbCmd::Quit => {
-                        eprintln!("[daemon] quit");
-                        return;
-                    }
-                },
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
-            }
-        }
-
-        // Update status
-        if let Ok(mut s) = status.lock() {
-            s.streaming = state.playing;
-            s.playing_id = state.playing_id.clone();
-            s.fps = state.fps;
-        }
-
-        // Send next frame if due
-        if state.playing && !state.frames.is_empty() {
             let now = Instant::now();
-            if now >= state.next_frame {
-                if let Some(ref dev) = device {
-                    if !usb::send_frame(dev, &state.frames[state.frame_idx]) {
-                        eprintln!("[daemon] device lost during frame send");
-                        device = None;
-                        if let Ok(mut s) = status.lock() {
-                            s.device_found = false;
-                        }
-                    } else {
-                        state.frame_idx = (state.frame_idx + 1) % state.frames.len();
-                        state.next_frame = now + Duration::from_secs_f32(1.0 / state.fps);
+            self.ensure_device(now);
+            self.finish_settle(now);
+            if QUIT.load(Ordering::Relaxed) {
+                self.quitting = true;
+            }
+            if self.quitting && self.settle.is_none() {
+                break;
+            }
+            self.publish_status();
+
+            match self.rx.recv_timeout(self.next_wakeup(now)) {
+                Ok((cmd, reply)) => self.handle(cmd, reply),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.quitting = true;
+                    if let Some(s) = &self.settle {
+                        std::thread::sleep(s.until.saturating_duration_since(Instant::now()));
                     }
                 }
-            } else {
-                // sleep only up to next frame, capped at 5ms so commands stay responsive
-                let wait = (state.next_frame - now).min(Duration::from_millis(5));
-                std::thread::sleep(wait);
             }
-        } else {
-            std::thread::sleep(Duration::from_millis(50));
+
+            self.send_due_frame();
+        }
+        if self.settle.is_none() {
+            eprintln!("[daemon] USB thread stopped");
+        }
+        // Dropping the handle releases the interfaces and re-attaches the kernel driver.
+    }
+
+    fn next_wakeup(&self, now: Instant) -> Duration {
+        let mut wait = DEVICE_RETRY;
+        if self.device.is_none() {
+            if let Some(t) = self.last_open_attempt {
+                wait = (t + DEVICE_RETRY).saturating_duration_since(now);
+            }
+        } else if let Some(s) = &self.settle {
+            wait = wait.min(s.until.saturating_duration_since(now));
+        } else if let Some(s) = &self.stream {
+            wait = wait.min(s.next.saturating_duration_since(now));
+        }
+        wait
+    }
+
+    fn ensure_device(&mut self, now: Instant) {
+        if let Some(dev) = &self.device {
+            let idle = self.stream.is_none() && self.settle.is_none();
+            if idle && now.duration_since(self.last_presence_check) >= PRESENCE_CHECK {
+                self.last_presence_check = now;
+                if !usb::still_connected(dev) {
+                    eprintln!("[usb] device disconnected");
+                    self.device = None;
+                }
+            }
+            return;
+        }
+        if self.last_open_attempt.is_some_and(|t| now.duration_since(t) < DEVICE_RETRY) {
+            return;
+        }
+        self.last_open_attempt = Some(now);
+        match usb::open() {
+            Ok(dev) => {
+                eprintln!("[usb] device opened");
+                self.device = Some(dev);
+                self.last_open_error = None;
+                self.last_presence_check = now;
+                if let Some(s) = &mut self.stream {
+                    s.next = now;
+                }
+                self.restore_autoplay();
+            }
+            Err(e) => {
+                // Log only on change, not every retry.
+                if self.last_open_error.as_deref() != Some(e.as_str()) {
+                    eprintln!("[usb] {e}");
+                    self.last_open_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// On the first successful open, resume the last video that was playing.
+    fn restore_autoplay(&mut self) {
+        if self.autoplay_checked || self.stream.is_some() {
+            return;
+        }
+        self.autoplay_checked = true;
+        let data = shared::data_dir();
+        let Some(id) = shared::load_autoplay(&data) else { return };
+        let (videos, _) = shared::load_videos(&data);
+        let Some(v) = videos.iter().find(|v| v.id == id) else { return };
+        let dir =
+            if v.rotation != 0 { shared::rotated_frames_dir(&data, &v.id) } else { shared::frames_dir(&data, &v.id) };
+        let frames = load_frames(&dir, v.frame_count);
+        let fps = shared::sanitize_fps(v.fps).unwrap_or(15.0);
+        if !frames.is_empty() {
+            eprintln!("[daemon] autoplay: {} ({} frames @ {fps} fps)", v.name, frames.len());
+            self.stream = Some(Stream::new(frames, fps, v.id.clone()));
+        }
+    }
+
+    fn finish_settle(&mut self, now: Instant) {
+        if self.settle.as_ref().is_some_and(|s| now >= s.until) {
+            let s = self.settle.take().unwrap();
+            eprintln!("[daemon] boot animation flash write complete");
+            if let Some(reply) = s.reply {
+                let _ = reply.send(Ok(()));
+            }
+            if let Some(st) = &mut self.stream {
+                st.next = now;
+            }
+        }
+    }
+
+    fn with_device<T>(&mut self, f: impl FnOnce(&usb::Handle) -> usb::Result<T>) -> Result<T, String> {
+        let Some(dev) = &self.device else { return Err("Device not found".into()) };
+        f(dev).map_err(|e| {
+            if e.device_gone {
+                eprintln!("[usb] device lost: {e}");
+                self.device = None;
+            }
+            e.msg
+        })
+    }
+
+    fn handle(&mut self, cmd: UsbCmd, mut reply: Option<Reply>) {
+        let data = shared::data_dir();
+        let result = match cmd {
+            UsbCmd::Play { frames, fps, id } => {
+                eprintln!("[daemon] play: {} frames @ {fps} fps", frames.len());
+                if let Err(e) = shared::save_autoplay(&data, Some(&id)) {
+                    eprintln!("[daemon] autoplay not saved: {e}");
+                }
+                self.stream = Some(Stream::new(frames, fps, id));
+                Ok(())
+            }
+            UsbCmd::Stop => {
+                eprintln!("[daemon] stop");
+                self.stream = None;
+                if let Err(e) = shared::save_autoplay(&data, None) {
+                    eprintln!("[daemon] autoplay not cleared: {e}");
+                }
+                Ok(())
+            }
+            UsbCmd::Screen(on) => {
+                if self.settle.is_some() {
+                    Err("The device is writing flash; try again in a few seconds".into())
+                } else {
+                    self.with_device(|d| usb::set_screen(d, on))
+                }
+            }
+            UsbCmd::Upload { slot, data, deadline } => {
+                if Instant::now() > deadline {
+                    Err("Upload was queued too long and has been cancelled; try again".into())
+                } else if self.settle.is_some() {
+                    Err("The device is still writing the previous upload to flash; try again shortly".into())
+                } else {
+                    eprintln!("[daemon] upload {slot:?}: {} bytes", data.len());
+                    match self.with_device(|d| usb::upload(d, slot, &data)) {
+                        Ok(()) if slot == usb::Slot::Boot => {
+                            eprintln!("[daemon] boot data committed; waiting for flash write");
+                            self.settle = Some(FlashSettle {
+                                until: Instant::now() + shared::BOOT_FLASH_SETTLE,
+                                reply: reply.take(),
+                            });
+                            Ok(())
+                        }
+                        r => {
+                            if let Err(e) = &r {
+                                eprintln!("[daemon] upload failed: {e}");
+                            }
+                            r
+                        }
+                    }
+                }
+            }
+            UsbCmd::Quit => {
+                eprintln!("[daemon] shutting down");
+                self.quitting = true;
+                Ok(())
+            }
+        };
+        if let Some(r) = reply {
+            let _ = r.send(result);
+        }
+    }
+
+    fn send_due_frame(&mut self) {
+        if self.settle.is_some() {
+            return;
+        }
+        let (Some(dev), Some(s)) = (&self.device, &mut self.stream) else { return };
+        if s.frames.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if now < s.next {
+            return;
+        }
+        match usb::send_frame(dev, &s.frames[s.idx]) {
+            Ok(()) => {
+                s.idx = (s.idx + 1) % s.frames.len();
+                s.next += s.period;
+                if s.next < now {
+                    s.next = now + s.period; // fell behind; don't burst to catch up
+                }
+            }
+            Err(e) => {
+                eprintln!("[daemon] frame send failed ({e}); reopening device");
+                self.device = None;
+            }
+        }
+    }
+
+    fn publish_status(&mut self) {
+        let s = DaemonStatus {
+            streaming: self.stream.is_some(),
+            playing_id: self.stream.as_ref().map(|s| s.id.clone()),
+            device_found: self.device.is_some(),
+            fps: self.stream.as_ref().map_or(0.0, |s| s.fps),
+            flash_busy: self.settle.is_some(),
+        };
+        if s != self.published {
+            if let Ok(mut st) = self.status.lock() {
+                *st = s.clone();
+            }
+            self.published = s;
         }
     }
 }
 
 // ── Socket server ─────────────────────────────────────────────────────────────
 
-fn handle_conn(
-    stream: UnixStream,
-    usb_tx: Arc<std::sync::mpsc::SyncSender<UsbCmd>>,
-    status: Arc<Mutex<DaemonStatus>>,
-) {
-    let mut writer = stream.try_clone().expect("clone stream");
-    let reader = BufReader::new(stream);
+fn dispatch(cmd: Cmd, tx: &SyncSender<Job>, status: &Mutex<DaemonStatus>) -> Result<Resp, String> {
+    let (job, timeout) = match cmd {
+        Cmd::Status => return Ok(Resp::Status(status.lock().map(|s| s.clone()).unwrap_or_default())),
+        Cmd::Play { frames_dir, fps, frame_count, id } => {
+            if !shared::is_valid_id(&id) {
+                return Err("invalid id".into());
+            }
+            let fps = shared::sanitize_fps(fps).ok_or("invalid fps")?;
+            if frame_count == 0 || frame_count > shared::MAX_STREAM_FRAMES {
+                return Err(format!("frame_count must be 1..={}", shared::MAX_STREAM_FRAMES));
+            }
+            let frames = load_frames(Path::new(&frames_dir), frame_count);
+            if frames.is_empty() {
+                return Err(format!("no frames found in {frames_dir}"));
+            }
+            (UsbCmd::Play { frames, fps, id }, QUICK_REPLY_TIMEOUT)
+        }
+        Cmd::Stop => (UsbCmd::Stop, QUICK_REPLY_TIMEOUT),
+        Cmd::ScreenOn => (UsbCmd::Screen(true), QUICK_REPLY_TIMEOUT),
+        Cmd::ScreenOff => (UsbCmd::Screen(false), QUICK_REPLY_TIMEOUT),
+        Cmd::UploadStandby { path } => {
+            let data = read_limited(Path::new(&path), shared::MAX_STANDBY_BYTES)?;
+            shared::validate_standby_jpeg(&data)?;
+            let deadline = Instant::now() + UPLOAD_START_DEADLINE;
+            (UsbCmd::Upload { slot: usb::Slot::Standby, data, deadline }, shared::DAEMON_UPLOAD_TIMEOUT)
+        }
+        Cmd::UploadBoot { path } => {
+            let data = read_limited(Path::new(&path), shared::MAX_BOOT_BYTES)?;
+            shared::validate_boot_container(&data)?;
+            let deadline = Instant::now() + UPLOAD_START_DEADLINE;
+            (UsbCmd::Upload { slot: usb::Slot::Boot, data, deadline }, shared::DAEMON_UPLOAD_TIMEOUT)
+        }
+    };
+
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    match tx.try_send((job, Some(reply_tx))) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => return Err("Daemon is busy; try again".into()),
+        Err(TrySendError::Disconnected(_)) => return Err("Daemon is shutting down".into()),
+    }
+    match reply_rx.recv_timeout(timeout) {
+        Ok(Ok(())) => Ok(Resp::Ok),
+        Ok(Err(msg)) => Err(msg),
+        Err(_) => Err("Timed out waiting for the device".into()),
+    }
+}
+
+fn handle_conn(stream: UnixStream, tx: SyncSender<Job>, status: Arc<Mutex<DaemonStatus>>) {
+    let _ = stream.set_read_timeout(Some(CONN_READ_TIMEOUT));
+    let Ok(mut writer) = stream.try_clone() else { return };
+    let reader = BufReader::new(stream.take(MAX_REQUEST_BYTES));
 
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        let cmd: Cmd = match serde_json::from_str(&line) {
-            Ok(c) => c,
+        let resp = match serde_json::from_str::<Cmd>(&line) {
+            Ok(cmd) => dispatch(cmd, &tx, &status).unwrap_or_else(|msg| Resp::Err { msg }),
+            Err(e) => Resp::Err { msg: format!("bad request: {e}") },
+        };
+        let Ok(json) = serde_json::to_string(&resp) else { break };
+        if writeln!(writer, "{json}").is_err() {
+            break;
+        }
+    }
+}
+
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+fn accept_loop(listener: UnixListener, tx: SyncSender<Job>, status: Arc<Mutex<DaemonStatus>>) {
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let s = match stream {
+            Ok(s) => s,
             Err(e) => {
-                let r = Resp::Err { msg: e.to_string() };
-                let _ = writeln!(writer, "{}", serde_json::to_string(&r).unwrap());
+                eprintln!("[daemon] accept error: {e}");
                 continue;
             }
         };
-
-        let resp = match cmd {
-            Cmd::Play { frames_dir, fps, frame_count, id } => {
-                let _ = usb_tx.send(UsbCmd::Play { frames_dir, fps, frame_count, id });
-                Resp::Ok
-            }
-            Cmd::Stop => {
-                let _ = usb_tx.send(UsbCmd::Stop);
-                Resp::Ok
-            }
-            Cmd::ScreenOn => {
-                let _ = usb_tx.send(UsbCmd::ScreenOn);
-                Resp::Ok
-            }
-            Cmd::ScreenOff => {
-                let _ = usb_tx.send(UsbCmd::ScreenOff);
-                Resp::Ok
-            }
-            Cmd::UploadStandby { path } => {
-                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-                let _ = usb_tx.send(UsbCmd::UploadStandby { path, done_tx });
-                match done_rx.recv_timeout(Duration::from_secs(60)) {
-                    Ok(Ok(())) => Resp::Ok,
-                    Ok(Err(e)) => Resp::Err { msg: e },
-                    Err(_) => Resp::Err { msg: "Upload timed out".into() },
-                }
-            }
-            Cmd::UploadBoot { path } => {
-                let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
-                let _ = usb_tx.send(UsbCmd::UploadBoot { path, done_tx });
-                match done_rx.recv_timeout(Duration::from_secs(120)) {
-                    Ok(Ok(())) => Resp::Ok,
-                    Ok(Err(e)) => Resp::Err { msg: e },
-                    Err(_) => Resp::Err { msg: "Boot upload timed out".into() },
-                }
-            }
-            Cmd::Status => {
-                let s = status.lock().map(|s| s.clone()).unwrap_or_default();
-                Resp::Status(s)
-            }
-        };
-
-        let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap());
+        if active.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::Relaxed);
+            continue; // dropping `s` closes it
+        }
+        let slot = ConnSlot(Arc::clone(&active));
+        let (tx, st) = (tx.clone(), Arc::clone(&status));
+        std::thread::spawn(move || {
+            let _slot = slot;
+            handle_conn(s, tx, st);
+        });
     }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn run() {
+/// Runs the daemon; returns the process exit code.
+pub fn run() -> i32 {
     eprintln!("[daemon] starting (PID {})", std::process::id());
 
-    let sock_path = socket_path();
-
-    // Remove stale socket
-    if sock_path.exists() {
-        let _ = fs::remove_file(&sock_path);
-    }
-
-    let listener = UnixListener::bind(&sock_path).expect("bind socket");
-    eprintln!("[daemon] listening on {:?}", sock_path);
-
-    let status: Arc<Mutex<DaemonStatus>> = Arc::new(Mutex::new(DaemonStatus::default()));
-
-    // USB thread
-    let (usb_tx, usb_rx) = std::sync::mpsc::sync_channel::<UsbCmd>(32);
-    let usb_tx = Arc::new(usb_tx);
-    {
-        let status = Arc::clone(&status);
-        std::thread::spawn(move || usb_thread(usb_rx, status));
-    }
-
-    // Cleanup on Ctrl-C
-    {
-        let sock_path = sock_path.clone();
-        let _ = ctrlc::set_handler(move || {
-            let _ = fs::remove_file(&sock_path);
-            std::process::exit(0);
-        });
-    }
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let tx = Arc::clone(&usb_tx);
-                let st = Arc::clone(&status);
-                std::thread::spawn(move || handle_conn(s, tx, st));
-            }
-            Err(e) => eprintln!("[daemon] accept error: {}", e),
+    // Single instance: hold an exclusive lock for the lifetime of the process.
+    let lock_path = shared::lock_path();
+    let lock = match File::options().create(true).truncate(false).write(true).open(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[daemon] cannot open {}: {e}", lock_path.display());
+            return 1;
+        }
+    };
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => {
+            eprintln!("[daemon] another daemon is already running");
+            return 0;
+        }
+        Err(fs::TryLockError::Error(e)) => {
+            eprintln!("[daemon] cannot lock {}: {e}", lock_path.display());
+            return 1;
         }
     }
+
+    // We hold the lock, so any existing socket is stale.
+    let sock_path = shared::socket_path();
+    let _ = fs::remove_file(&sock_path);
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[daemon] cannot bind {}: {e}", sock_path.display());
+            return 1;
+        }
+    };
+    let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600));
+    eprintln!("[daemon] listening on {}", sock_path.display());
+
+    let status = Arc::new(Mutex::new(DaemonStatus::default()));
+    let (tx, rx) = mpsc::sync_channel::<Job>(QUEUE_DEPTH);
+
+    let usb_thread = {
+        let status = Arc::clone(&status);
+        match std::thread::Builder::new().name("usb".into()).spawn(move || UsbThread::new(rx, status).run()) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[daemon] cannot start USB thread: {e}");
+                return 1;
+            }
+        }
+    };
+
+    // SIGINT/SIGTERM/SIGHUP: let the USB thread finish any upload in progress
+    // (including the flash settle time) before exiting.
+    {
+        let tx = tx.clone();
+        if let Err(e) = ctrlc::set_handler(move || {
+            QUIT.store(true, Ordering::Relaxed);
+            let _ = tx.try_send((UsbCmd::Quit, None));
+        }) {
+            eprintln!("[daemon] cannot install signal handler: {e}");
+        }
+    }
+
+    {
+        let status = Arc::clone(&status);
+        std::thread::spawn(move || accept_loop(listener, tx, status));
+    }
+
+    let code = match usb_thread.join() {
+        Ok(()) => 0,
+        Err(_) => {
+            eprintln!("[daemon] USB thread panicked");
+            1
+        }
+    };
+    let _ = fs::remove_file(&sock_path);
+    drop(lock);
+    code
 }

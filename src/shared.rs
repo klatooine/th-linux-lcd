@@ -1,30 +1,105 @@
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+/// Display resolution (square).
+pub const LCD_SIZE: u32 = 480;
+
+/// Most frames an imported animation keeps / the daemon will stream.
+pub const MAX_STREAM_FRAMES: usize = 60;
+/// Target size per streamed JPEG frame.
+pub const STREAM_FRAME_BUDGET: usize = 20 * 1024;
+pub const MIN_STREAM_FPS: f32 = 1.0;
+pub const MAX_STREAM_FPS: f32 = 30.0;
+
+/// Upper bound for a standby JPEG sent to flash. The real slot size is
+/// unknown; this stays far below anything observed to work.
+pub const MAX_STANDBY_BYTES: usize = 256 * 1024;
+
+/// The firmware expects exactly this many frames in a boot container.
+pub const BOOT_FRAMES: usize = 40;
+/// Firmware silently rejects containers faster than this (timing < 80 ms).
+pub const MIN_BOOT_TIMING_MS: u8 = 80;
+pub const MAX_BOOT_FPS: f32 = 1000.0 / MIN_BOOT_TIMING_MS as f32;
+/// Upper bound for a boot container. The known-good container from the
+/// Windows app is 1,238,420 bytes; the slot size itself is unknown, so stay
+/// close to that.
+pub const MAX_BOOT_BYTES: usize = 1_310_720;
+/// Per-frame JPEG budget that keeps a full container under `MAX_BOOT_BYTES`.
+pub const BOOT_FRAME_BUDGET: usize = 31 * 1024;
+/// How long the device keeps writing flash after a boot-animation commit.
+pub const BOOT_FLASH_SETTLE: Duration = Duration::from_secs(30);
+
+/// How long the daemon waits for the USB thread to finish an upload
+/// (transfer + flash settle).
+pub const DAEMON_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long the GUI waits for any reply to an upload command.
+pub const CLIENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(210);
+/// How long the GUI waits for a reply to any other command.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Clamp a frame rate to the streaming range; rejects NaN/inf/≤0.
+pub fn sanitize_fps(fps: f32) -> Option<f32> {
+    (fps.is_finite() && fps > 0.0).then(|| fps.clamp(MIN_STREAM_FPS, MAX_STREAM_FPS))
+}
 
 // ── Paths ────────────────────────────────────────────────────────────────────
 
+/// Per-user runtime directory for the socket and lock file.
+/// Uses `$XDG_RUNTIME_DIR`; never falls back to the shared `/tmp`.
+pub fn runtime_dir() -> PathBuf {
+    if let Some(d) = dirs::runtime_dir() {
+        return d;
+    }
+    let d = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".")).join("th-linux-lcd");
+    let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(&d);
+    d
+}
+
 pub fn socket_path() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(runtime).join("th-lcd.sock")
+    runtime_dir().join("th-lcd.sock")
+}
+
+pub fn lock_path() -> PathBuf {
+    runtime_dir().join("th-lcd.lock")
 }
 
 pub fn data_dir() -> PathBuf {
     let d = dirs::data_dir().unwrap_or_default().join("th-linux-lcd");
-    fs::create_dir_all(&d).ok();
+    let _ = fs::create_dir_all(&d);
     d
 }
 
-pub fn frames_dir(data: &PathBuf, id: &str) -> PathBuf {
-    let d = data.join("frames").join(id);
-    fs::create_dir_all(&d).ok();
-    d
+/// Library item ids are UUIDs; anything else is refused before being used
+/// as a path component.
+pub fn is_valid_id(id: &str) -> bool {
+    uuid::Uuid::try_parse(id).is_ok()
 }
 
-pub fn standby_dir(data: &PathBuf) -> PathBuf {
-    let d = data.join("standby");
-    fs::create_dir_all(&d).ok();
-    d
+pub fn frames_dir(data: &Path, id: &str) -> PathBuf {
+    data.join("frames").join(id)
+}
+
+/// Cache of rotated frames for a video with non-zero rotation.
+pub fn rotated_frames_dir(data: &Path, id: &str) -> PathBuf {
+    data.join("frames").join(format!("{id}-rotated"))
+}
+
+pub fn frame_file(dir: &Path, index: usize) -> PathBuf {
+    dir.join(format!("f{index:05}.jpg"))
+}
+
+pub fn standby_dir(data: &Path) -> PathBuf {
+    data.join("standby")
+}
+
+pub fn boot_dir(data: &Path) -> PathBuf {
+    data.join("boot")
 }
 
 // ── IPC protocol ─────────────────────────────────────────────────────────────
@@ -42,6 +117,15 @@ pub enum Cmd {
     Status,
 }
 
+impl Cmd {
+    fn reply_timeout(&self) -> Duration {
+        match self {
+            Cmd::UploadStandby { .. } | Cmd::UploadBoot { .. } => CLIENT_UPLOAD_TIMEOUT,
+            _ => CLIENT_TIMEOUT,
+        }
+    }
+}
+
 /// Responses sent from daemon → GUI
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -51,12 +135,15 @@ pub enum Resp {
     Status(DaemonStatus),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct DaemonStatus {
     pub streaming: bool,
     pub playing_id: Option<String>,
     pub device_found: bool,
     pub fps: f32,
+    /// The device is still writing a boot animation to flash.
+    #[serde(default)]
+    pub flash_busy: bool,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -80,150 +167,277 @@ pub struct StandbyImage {
     pub thumbnail: String, // base64-encoded 96×96 JPEG
 }
 
-// ── Persistence ───────────────────────────────────────────────────────────────
-
-pub fn load_videos(data: &PathBuf) -> Vec<Video> {
-    let p = data.join("videos.json");
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_videos(data: &PathBuf, videos: &[Video]) {
-    let _ = fs::write(data.join("videos.json"), serde_json::to_string_pretty(videos).unwrap());
-}
-
-pub fn load_standby(data: &PathBuf) -> Vec<StandbyImage> {
-    let p = data.join("standby.json");
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_standby(data: &PathBuf, images: &[StandbyImage]) {
-    let _ = fs::write(data.join("standby.json"), serde_json::to_string_pretty(images).unwrap());
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootAnim {
     pub id: String,
     pub name: String,
-    pub path: String,        // path to .bootanim binary on disk
-    pub source_gif: String,  // original GIF path (for re-encoding with rotation)
+    pub path: String,       // path to .bootanim binary on disk
+    pub source_gif: String, // original GIF path (for re-encoding with rotation)
     pub frame_count: usize,
     pub fps: f32,
-    pub rotation: i32,       // 0, 90, 180, 270
-    pub thumbnail: String,   // base64-encoded 96×96 JPEG of first frame
+    pub rotation: i32,     // 0, 90, 180, 270
+    pub thumbnail: String, // base64-encoded 96×96 JPEG of first frame
 }
 
-pub fn load_boot(data: &PathBuf) -> Vec<BootAnim> {
-    let p = data.join("boot.json");
-    fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+// ── Persistence ───────────────────────────────────────────────────────────────
+
+const VIDEOS_JSON: &str = "videos.json";
+const STANDBY_JSON: &str = "standby.json";
+const BOOT_JSON: &str = "boot.json";
+const AUTOPLAY_JSON: &str = "autoplay.json";
+
+/// Write `bytes` to `path` via a temp file + fsync + rename, so a crash or
+/// full disk never leaves a truncated file behind.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    result.map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("could not write {}: {e}", path.display())
+    })
 }
 
-pub fn save_boot(data: &PathBuf, anims: &[BootAnim]) {
-    let _ = fs::write(data.join("boot.json"), serde_json::to_string_pretty(anims).unwrap());
+/// Load a JSON list. A missing file is an empty list. A file that cannot be
+/// read or parsed is backed up to `*.corrupt` (so a later save cannot destroy
+/// it) and reported in the second tuple element.
+fn load_list<T: DeserializeOwned>(path: &Path) -> (Vec<T>, Option<String>) {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => return (Vec::new(), Some(format!("could not read {}: {e}", path.display()))),
+    };
+    match serde_json::from_str(&text) {
+        Ok(v) => (v, None),
+        Err(e) => {
+            let backup = path.with_extension("json.corrupt");
+            let _ = fs::copy(path, &backup);
+            let msg = format!("{} is corrupt ({e}); a copy was saved to {}", path.display(), backup.display());
+            (Vec::new(), Some(msg))
+        }
+    }
+}
+
+fn save_list<T: Serialize>(path: &Path, items: &[T]) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?;
+    write_atomic(path, &json)
+}
+
+pub fn load_videos(data: &Path) -> (Vec<Video>, Option<String>) {
+    load_list(&data.join(VIDEOS_JSON))
+}
+
+pub fn save_videos(data: &Path, videos: &[Video]) -> Result<(), String> {
+    save_list(&data.join(VIDEOS_JSON), videos)
+}
+
+pub fn load_standby(data: &Path) -> (Vec<StandbyImage>, Option<String>) {
+    load_list(&data.join(STANDBY_JSON))
+}
+
+pub fn save_standby(data: &Path, images: &[StandbyImage]) -> Result<(), String> {
+    save_list(&data.join(STANDBY_JSON), images)
+}
+
+pub fn load_boot(data: &Path) -> (Vec<BootAnim>, Option<String>) {
+    load_list(&data.join(BOOT_JSON))
+}
+
+pub fn save_boot(data: &Path, anims: &[BootAnim]) -> Result<(), String> {
+    save_list(&data.join(BOOT_JSON), anims)
 }
 
 // ── Autoplay persistence ──────────────────────────────────────────────────────
 
 /// Returns the video ID that should auto-play on daemon start, if any.
-pub fn load_autoplay(data: &PathBuf) -> Option<String> {
-    let p = data.join("autoplay.json");
-    fs::read_to_string(&p)
+pub fn load_autoplay(data: &Path) -> Option<String> {
+    fs::read_to_string(data.join(AUTOPLAY_JSON))
         .ok()
         .and_then(|s| serde_json::from_str::<String>(&s).ok())
+        .filter(|id| is_valid_id(id))
 }
 
 /// Persist `id` as the autoplay target, or clear it if `id` is None.
-pub fn save_autoplay(data: &PathBuf, id: Option<&str>) {
-    let p = data.join("autoplay.json");
+pub fn save_autoplay(data: &Path, id: Option<&str>) -> Result<(), String> {
+    let p = data.join(AUTOPLAY_JSON);
     match id {
-        Some(id) => { let _ = fs::write(p, serde_json::to_string(id).unwrap()); }
-        None     => { let _ = fs::remove_file(p); }
+        Some(id) => write_atomic(&p, serde_json::to_string(id).map_err(|e| e.to_string())?.as_bytes()),
+        None => match fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        },
     }
 }
 
-pub fn boot_dir(data: &PathBuf) -> PathBuf {
-    let d = data.join("boot");
-    fs::create_dir_all(&d).ok();
-    d
+// ── Boot container (Update_Boot_GIF) ──────────────────────────────────────────
+
+const BOOT_MAGIC: &[u8; 15] = b"Update_Boot_GIF";
+const BOOT_HDR: usize = 32; // 16-byte outer header + 16-byte magic
+const BOOT_ENTRY: usize = 16;
+const BOOT_SUB_HDR: usize = 8;
+const BOOT_TRAILER: usize = 16;
+const BOOT_ENTRY_CONST: u32 = 0x4000_0008; // constant observed in traces
+
+/// Header checksum: -(full container size + n_frames × 17) as i32.
+fn boot_checksum(full_size: usize, n_frames: usize) -> i32 {
+    (-(full_size as i64 + n_frames as i64 * 17)) as i32
 }
 
-/// Build the Update_Boot_GIF binary container from a list of 480×480 JPEG frames.
-/// `fps` controls the playback speed (timing byte = round(1000/fps)).
-/// Returns the raw bytes to be written to disk and uploaded.
-pub fn build_boot_container(frames: &[Vec<u8>], fps: f32) -> Vec<u8> {
-    let n = frames.len() as u8;
-    let tbl_size = (n as u32) * 16;
-    // Firmware rejects timing < 80ms (> 12.5fps) — cap playback at 12.5fps
-    let fps_capped = fps.min(12.5).max(1.0);
-    let timing = (1000.0 / fps_capped).round() as u8;
+/// Frame-table flags: negated end offset of the frame entry.
+fn boot_entry_flags(offset: usize, jpeg_len: usize) -> i32 {
+    (-((offset + BOOT_SUB_HDR + jpeg_len) as i64)) as i32
+}
 
-    // Frame offsets — each frame entry is: 8-byte filename sub-header + JPEG bytes
-    const TBL_OFF: u32 = 32;
-    const SUB_HDR: u32 = 8;
-    let data_start = TBL_OFF + tbl_size;
-    let mut offsets: Vec<u32> = Vec::with_capacity(n as usize);
+/// Build the Update_Boot_GIF container from 480×480 JPEG frames.
+/// `fps` is capped at `MAX_BOOT_FPS` (timing byte = round(1000/fps)).
+pub fn build_boot_container(frames: &[Vec<u8>], fps: f32) -> Result<Vec<u8>, String> {
+    let n = u8::try_from(frames.len())
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| format!("{} frames is out of range", frames.len()))?;
+    let fps = if fps.is_finite() { fps.clamp(1.0, MAX_BOOT_FPS) } else { MAX_BOOT_FPS };
+    let timing = (1000.0 / fps).round().min(255.0) as u8;
+
+    let data_start = BOOT_HDR + frames.len() * BOOT_ENTRY;
+    let mut offsets = Vec::with_capacity(frames.len());
     let mut cur = data_start;
     for frame in frames {
         offsets.push(cur);
-        cur += SUB_HDR + frame.len() as u32;
+        cur += BOOT_SUB_HDR + frame.len();
     }
-    // cur = offset where trailer starts. Full container = cur + 16 (trailer).
-    // content_size = full - outer_header(16) = cur. Checksum uses full container size.
-    let content_size = cur;
-    let full_size    = cur + 16;
-    let checksum = (-(full_size as i64 + n as i64 * 17)) as i32;
+    let full_size = cur + BOOT_TRAILER;
+    let content_size = u32::try_from(full_size - 16).map_err(|_| "container too large".to_string())?;
 
-    let mut buf = Vec::with_capacity(full_size as usize);
+    let mut buf = Vec::with_capacity(full_size);
 
     // Outer header (16 bytes)
-    buf.extend_from_slice(&checksum.to_le_bytes());
+    buf.extend_from_slice(&boot_checksum(full_size, frames.len()).to_le_bytes());
     buf.extend_from_slice(&content_size.to_le_bytes());
-    buf.extend_from_slice(&tbl_size.to_le_bytes());
-    buf.push(0x10);
-    buf.push(0x00);
-    buf.push(n);
-    buf.push(timing);
+    buf.extend_from_slice(&(u32::from(n) * BOOT_ENTRY as u32).to_le_bytes());
+    buf.extend_from_slice(&[0x10, 0x00, n, timing]);
 
     // Magic (16 bytes, null-padded)
-    let mut magic = [0u8; 16];
-    magic[..15].copy_from_slice(b"Update_Boot_GIF");
-    buf.extend_from_slice(&magic);
+    buf.extend_from_slice(BOOT_MAGIC);
+    buf.push(0);
 
-    // Frame table — flags[i] = -(offset[i] + 8 + frame_size[i]) as int32
-    // This encodes the negated start of the next frame (confirmed from traces)
-    for (&off, frame) in offsets.iter().zip(frames.iter()) {
-        let flags = (-(off as i64 + 8 + frame.len() as i64)) as i32;
-        buf.extend_from_slice(&flags.to_le_bytes());
-        buf.extend_from_slice(&off.to_le_bytes());
+    // Frame table
+    for (&off, frame) in offsets.iter().zip(frames) {
+        buf.extend_from_slice(&boot_entry_flags(off, frame.len()).to_le_bytes());
+        buf.extend_from_slice(&(off as u32).to_le_bytes());
         buf.extend_from_slice(&(frame.len() as u32).to_le_bytes()); // JPEG size, excl. sub-header
-        buf.extend_from_slice(&0x40000008u32.to_le_bytes()); // constant observed in traces
+        buf.extend_from_slice(&BOOT_ENTRY_CONST.to_le_bytes());
     }
 
-    // Frame data
+    // Frame data: 8-byte null-padded name "NNN.jpg\0" + JPEG
     for (i, frame) in frames.iter().enumerate() {
-        // 8-byte null-padded filename: "NNN.jpg\0"
-        let name = format!("{:03}.jpg", i);
-        let mut sub = [0u8; 8];
-        let nb = name.as_bytes();
-        sub[..nb.len().min(7)].copy_from_slice(&nb[..nb.len().min(7)]);
+        let mut sub = [0u8; BOOT_SUB_HDR];
+        let name = format!("{i:03}.jpg");
+        sub[..7].copy_from_slice(&name.as_bytes()[..7]);
         buf.extend_from_slice(&sub);
         buf.extend_from_slice(frame);
     }
 
     // 16-byte trailer required by firmware: 15 zero bytes + 0x10
-    // Observed in both Windows trace sessions; absent → device rejects CMD 0x14
     buf.extend_from_slice(&[0u8; 15]);
     buf.push(0x10);
 
-    buf
+    debug_assert_eq!(buf.len(), full_size);
+    Ok(buf)
+}
+
+fn le_u32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+/// Check a boot container byte-for-byte against the known-good format before
+/// it is written to flash.
+pub fn validate_boot_container(data: &[u8]) -> Result<(), String> {
+    let len = data.len();
+    if len < BOOT_HDR + BOOT_TRAILER {
+        return Err(format!("boot container too small ({len} bytes)"));
+    }
+    if len > MAX_BOOT_BYTES {
+        return Err(format!("boot container is {len} bytes; the limit is {MAX_BOOT_BYTES}. Re-import the GIF."));
+    }
+    if &data[16..31] != BOOT_MAGIC || data[31] != 0 {
+        return Err("not an Update_Boot_GIF container (bad magic)".into());
+    }
+    let n = usize::from(data[14]);
+    let timing = data[15];
+    if data[12] != 0x10 || data[13] != 0x00 {
+        return Err("bad container header".into());
+    }
+    if n != BOOT_FRAMES {
+        return Err(format!("container has {n} frames; the firmware expects {BOOT_FRAMES}"));
+    }
+    if timing < MIN_BOOT_TIMING_MS {
+        return Err(format!("frame timing {timing} ms is below the firmware minimum of {MIN_BOOT_TIMING_MS} ms"));
+    }
+    if le_u32(&data[4..8]) as usize + 16 != len {
+        return Err("content size field does not match file size".into());
+    }
+    if le_u32(&data[8..12]) as usize != n * BOOT_ENTRY {
+        return Err("frame table size field is wrong".into());
+    }
+    if le_u32(&data[0..4]) as i32 != boot_checksum(len, n) {
+        return Err("checksum mismatch".into());
+    }
+    let trailer_start = len - BOOT_TRAILER;
+    if data[trailer_start..len - 1].iter().any(|&b| b != 0) || data[len - 1] != 0x10 {
+        return Err("bad container trailer".into());
+    }
+
+    let mut expected = BOOT_HDR + n * BOOT_ENTRY;
+    for i in 0..n {
+        let e = &data[BOOT_HDR + i * BOOT_ENTRY..BOOT_HDR + (i + 1) * BOOT_ENTRY];
+        let off = le_u32(&e[4..8]) as usize;
+        let size = le_u32(&e[8..12]) as usize;
+        if off != expected {
+            return Err(format!("frame {i}: unexpected offset {off}"));
+        }
+        let end = off + BOOT_SUB_HDR + size;
+        if size < 4 || end > trailer_start {
+            return Err(format!("frame {i}: size {size} out of bounds"));
+        }
+        if le_u32(&e[0..4]) as i32 != boot_entry_flags(off, size) || le_u32(&e[12..16]) != BOOT_ENTRY_CONST {
+            return Err(format!("frame {i}: bad table entry"));
+        }
+        if data[off + BOOT_SUB_HDR..off + BOOT_SUB_HDR + 2] != [0xFF, 0xD8] {
+            return Err(format!("frame {i} is not a JPEG"));
+        }
+        expected = end;
+    }
+    if expected != trailer_start {
+        return Err("frame data does not end at the trailer".into());
+    }
+    Ok(())
+}
+
+/// Check a standby image before it is written to flash.
+pub fn validate_standby_jpeg(data: &[u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("standby image is empty".into());
+    }
+    if data.len() > MAX_STANDBY_BYTES {
+        return Err(format!("standby image is {} bytes; the limit is {MAX_STANDBY_BYTES}. Re-import it.", data.len()));
+    }
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return Err("standby image is not a JPEG".into());
+    }
+    let dims = image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Jpeg)
+        .into_dimensions()
+        .map_err(|e| format!("standby image is not a valid JPEG: {e}"))?;
+    if dims != (LCD_SIZE, LCD_SIZE) {
+        return Err(format!("standby image is {}×{}; it must be {LCD_SIZE}×{LCD_SIZE}", dims.0, dims.1));
+    }
+    Ok(())
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -234,15 +448,18 @@ pub fn daemon_cmd(cmd: &Cmd) -> Result<Resp, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream;
 
-    let mut stream = UnixStream::connect(socket_path())
-        .map_err(|_| "Daemon not running".to_string())?;
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+    let mut stream = UnixStream::connect(socket_path()).map_err(|_| "Daemon not running".to_string())?;
+    let _ = stream.set_read_timeout(Some(cmd.reply_timeout()));
+    let _ = stream.set_write_timeout(Some(CLIENT_TIMEOUT));
 
-    let line = serde_json::to_string(cmd).unwrap() + "\n";
+    let line = serde_json::to_string(cmd).map_err(|e| e.to_string())? + "\n";
     stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
 
     let mut resp_line = String::new();
-    BufReader::new(stream).read_line(&mut resp_line).map_err(|e| e.to_string())?;
+    BufReader::new(stream).read_line(&mut resp_line).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "no reply from daemon (timed out)".to_string(),
+        _ => e.to_string(),
+    })?;
     serde_json::from_str(resp_line.trim()).map_err(|e| e.to_string())
 }
 
@@ -256,19 +473,153 @@ pub fn decode_thumbnail(b64: &str) -> Option<(Vec<u8>, [usize; 2])> {
     Some((img.into_raw(), [w, h]))
 }
 
-/// Encode a JPEG file to a base64 thumbnail (96×96)
-pub fn make_thumbnail(path: &PathBuf) -> String {
+/// Encode an image (JPEG/PNG bytes) to a base64 96×96 JPEG thumbnail.
+pub fn thumbnail_from_bytes(bytes: &[u8]) -> String {
     use base64::Engine;
-    image::open(path)
-        .ok()
-        .map(|i| {
-            let small = i.resize(96, 96, image::imageops::FilterType::Lanczos3);
-            let mut buf = Vec::new();
-            small
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
-                .ok();
-            buf
-        })
-        .map(|b| base64::engine::general_purpose::STANDARD.encode(&b))
-        .unwrap_or_default()
+    let Ok(img) = image::load_from_memory(bytes) else { return String::new() };
+    let small = img.resize(96, 96, image::imageops::FilterType::Lanczos3).to_rgb8();
+    let mut buf = Vec::new();
+    if small.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).is_err() {
+        return String::new();
+    }
+    base64::engine::general_purpose::STANDARD.encode(&buf)
+}
+
+/// Encode an image file to a base64 96×96 JPEG thumbnail.
+pub fn make_thumbnail(path: &Path) -> String {
+    fs::read(path).map(|b| thumbnail_from_bytes(&b)).unwrap_or_default()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_jpeg(len: usize) -> Vec<u8> {
+        let mut v = vec![0xAB; len];
+        v[0] = 0xFF;
+        v[1] = 0xD8;
+        v
+    }
+
+    fn container() -> Vec<u8> {
+        let frames: Vec<_> = (0..BOOT_FRAMES).map(|i| fake_jpeg(1000 + i)).collect();
+        build_boot_container(&frames, 12.5).unwrap()
+    }
+
+    #[test]
+    fn checksum_matches_windows_trace() {
+        // Known-good container captured from the Windows app.
+        assert_eq!(boot_checksum(1_238_420, 40) as u32, 0xFFED_17C4);
+    }
+
+    #[test]
+    fn built_container_validates() {
+        let c = container();
+        validate_boot_container(&c).unwrap();
+        assert_eq!(c[14] as usize, BOOT_FRAMES);
+        assert_eq!(c[15], MIN_BOOT_TIMING_MS);
+        assert_eq!(&c[c.len() - 16..], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10]);
+    }
+
+    #[test]
+    fn fps_is_capped_for_boot() {
+        let frames: Vec<_> = (0..BOOT_FRAMES).map(|_| fake_jpeg(100)).collect();
+        let c = build_boot_container(&frames, 60.0).unwrap();
+        assert_eq!(c[15], MIN_BOOT_TIMING_MS);
+        let c = build_boot_container(&frames, f32::NAN).unwrap();
+        assert_eq!(c[15], MIN_BOOT_TIMING_MS);
+    }
+
+    #[test]
+    fn rejects_corrupted_containers() {
+        let good = container();
+
+        assert!(validate_boot_container(&good[..good.len() - 1]).is_err(), "truncated");
+        assert!(validate_boot_container(&[]).is_err(), "empty");
+
+        let mut c = good.clone();
+        c[20] ^= 1;
+        assert!(validate_boot_container(&c).is_err(), "magic");
+
+        let mut c = good.clone();
+        c[15] = 50;
+        assert!(validate_boot_container(&c).is_err(), "timing");
+
+        let mut c = good.clone();
+        c[0] ^= 1;
+        assert!(validate_boot_container(&c).is_err(), "checksum");
+
+        let mut c = good.clone();
+        let f0 = BOOT_HDR + BOOT_FRAMES * BOOT_ENTRY + BOOT_SUB_HDR;
+        c[f0] = 0;
+        assert!(validate_boot_container(&c).is_err(), "frame not JPEG");
+
+        let few: Vec<_> = (0..10).map(|_| fake_jpeg(100)).collect();
+        let c = build_boot_container(&few, 12.5).unwrap();
+        assert!(validate_boot_container(&c).is_err(), "wrong frame count");
+    }
+
+    #[test]
+    fn rejects_oversized_container() {
+        let frames: Vec<_> = (0..BOOT_FRAMES).map(|_| fake_jpeg(MAX_BOOT_BYTES / BOOT_FRAMES)).collect();
+        let c = build_boot_container(&frames, 12.5).unwrap();
+        assert!(validate_boot_container(&c).unwrap_err().contains("limit"));
+    }
+
+    #[test]
+    fn frame_budget_fits_limit() {
+        let worst = BOOT_HDR + BOOT_FRAMES * (BOOT_ENTRY + BOOT_SUB_HDR + BOOT_FRAME_BUDGET) + BOOT_TRAILER;
+        assert!(worst <= MAX_BOOT_BYTES);
+    }
+
+    #[test]
+    fn standby_validation() {
+        let img = image::RgbImage::new(LCD_SIZE, LCD_SIZE);
+        let mut jpeg = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        validate_standby_jpeg(&jpeg).unwrap();
+
+        let small = image::RgbImage::new(100, 100);
+        let mut jpeg = Vec::new();
+        small.write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        assert!(validate_standby_jpeg(&jpeg).is_err());
+        assert!(validate_standby_jpeg(&[]).is_err());
+        assert!(validate_standby_jpeg(b"GIF89a").is_err());
+    }
+
+    #[test]
+    fn fps_sanitizing() {
+        assert_eq!(sanitize_fps(0.0), None);
+        assert_eq!(sanitize_fps(-5.0), None);
+        assert_eq!(sanitize_fps(f32::NAN), None);
+        assert_eq!(sanitize_fps(f32::INFINITY), None);
+        assert_eq!(sanitize_fps(0.01), Some(MIN_STREAM_FPS));
+        assert_eq!(sanitize_fps(1000.0), Some(MAX_STREAM_FPS));
+        assert_eq!(sanitize_fps(15.0), Some(15.0));
+    }
+
+    #[test]
+    fn ids_must_be_uuids() {
+        assert!(is_valid_id("6f1c1c1e-8a7e-4d43-9a43-0d6f0f6a1b2c"));
+        assert!(!is_valid_id("../../.."));
+        assert!(!is_valid_id(""));
+    }
+
+    #[test]
+    fn atomic_write_and_corrupt_backup() {
+        let dir = std::env::temp_dir().join(format!("th-lcd-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        save_videos(&dir, &[]).unwrap();
+        let (v, err) = load_videos(&dir);
+        assert!(v.is_empty() && err.is_none());
+        assert!(!dir.join("videos.json.tmp").exists());
+        fs::write(dir.join(VIDEOS_JSON), b"{ truncated").unwrap();
+        let (v, err) = load_videos(&dir);
+        assert!(v.is_empty());
+        assert!(err.unwrap().contains("corrupt"));
+        assert!(dir.join("videos.json.corrupt").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

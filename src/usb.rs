@@ -1,163 +1,241 @@
-use rusb::DeviceHandle;
+//! Low-level USB protocol for the TH420V2 Ultra LCD (VID 0x264a, PID 0x233c).
+//!
+//! Frame streaming is volatile. Only two device-flash slots are ever written:
+//! standby (kind 0) and boot animation (kind 1). There is no firmware-update,
+//! DFU or erase command anywhere in this crate.
+
+use rusb::{DeviceHandle, GlobalContext};
 use std::time::Duration;
 
-const VID: u16 = 0x264a;
-const PID: u16 = 0x233c;
-const EP_OUT: u8 = 0x03;   // interface 1 — animation frames
-const EP_IN: u8 = 0x84;    // interface 1 — drain after each frame
-const EP_CTRL: u8 = 0x01;  // interface 0 — control commands
-const EP_CTRL_IN: u8 = 0x82; // interface 0 — ACK responses (440-byte, one per completed command)
-const PKT: usize = 1024;
-const PAYLOAD: usize = PKT - 4;
-const CTRL: usize = 440;
+pub type Handle = DeviceHandle<GlobalContext>;
 
-pub fn open() -> Option<DeviceHandle<rusb::GlobalContext>> {
-    let dev = match rusb::open_device_with_vid_pid(VID, PID) {
-        Some(d) => d,
-        None => {
-            eprintln!("[usb] device {:04x}:{:04x} not found", VID, PID);
-            return None;
+pub const VID: u16 = 0x264a;
+pub const PID: u16 = 0x233c;
+
+const EP_FRAME_OUT: u8 = 0x03; // interface 1 — animation frames
+const EP_FRAME_IN: u8 = 0x84; // interface 1 — drain after each frame
+const EP_CTRL_OUT: u8 = 0x01; // interface 0 — control commands
+const EP_CTRL_IN: u8 = 0x82; // interface 0 — replies (command byte echoed at [0])
+
+const FRAME_PKT: usize = 1024;
+const FRAME_PAYLOAD: usize = FRAME_PKT - 4;
+const CTRL_PKT: usize = 440;
+
+const CMD_FRAME: u8 = 0x08;
+const CMD_INIT: u8 = 0x0a;
+const CMD_CHUNK: u8 = 0x0b;
+const CMD_SCREEN: u8 = 0x12;
+const CMD_COMMIT: u8 = 0x14;
+const CMD_FINALIZE: u8 = 0x82;
+
+const FLAG_FIRST: u8 = 0x80;
+const COMMIT_ARG: u8 = 0x62; // byte[4] of CMD_COMMIT, as sent by the Windows app
+const BRIGHTNESS_ON: u8 = 0x64;
+
+const UPLOAD_CHUNK: usize = 10240;
+const CHUNK_HDR_DATA: usize = 424;
+const CHUNK_PKT_DATA: usize = 436;
+
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Largest frame `send_frame` can address (the packet count is a u8).
+pub const MAX_FRAME_BYTES: usize = 255 * FRAME_PAYLOAD;
+
+/// Device flash slot selected by the INIT command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    Standby = 0,
+    Boot = 1,
+}
+
+#[derive(Debug)]
+pub struct Error {
+    pub msg: String,
+    /// The handle is unusable (unplugged / I/O error) and should be dropped.
+    pub device_gone: bool,
+}
+
+impl Error {
+    fn other(msg: impl Into<String>) -> Self {
+        Self { msg: msg.into(), device_gone: false }
+    }
+}
+
+impl From<rusb::Error> for Error {
+    fn from(e: rusb::Error) -> Self {
+        let device_gone = matches!(e, rusb::Error::NoDevice | rusb::Error::Io | rusb::Error::NotFound);
+        Self { msg: e.to_string(), device_gone }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Find, open and claim the device.
+pub fn open() -> std::result::Result<Handle, String> {
+    let devices = rusb::devices().map_err(|e| format!("cannot list USB devices: {e}"))?;
+    let device = devices
+        .iter()
+        .find(|d| d.device_descriptor().is_ok_and(|desc| desc.vendor_id() == VID && desc.product_id() == PID))
+        .ok_or_else(|| format!("device {VID:04x}:{PID:04x} not found"))?;
+    let dev = device.open().map_err(|e| match e {
+        rusb::Error::Access => {
+            format!("permission denied opening {VID:04x}:{PID:04x} — is the udev rule installed? (see README)")
         }
-    };
+        e => format!("open {VID:04x}:{PID:04x}: {e}"),
+    })?;
+
+    // Let libusb detach the kernel HID driver on claim and re-attach it on release.
+    let auto_detach = dev.set_auto_detach_kernel_driver(true).is_ok();
     for iface in 0..=1u8 {
-        match dev.kernel_driver_active(iface) {
-            Ok(true) => {
-                if let Err(e) = dev.detach_kernel_driver(iface) {
-                    eprintln!("[usb] detach iface {}: {}", iface, e);
-                    return None;
-                }
-            }
-            Ok(false) => {}
-            Err(e) => eprintln!("[usb] kernel_driver_active iface {}: {}", iface, e),
+        if !auto_detach && dev.kernel_driver_active(iface).unwrap_or(false) {
+            dev.detach_kernel_driver(iface).map_err(|e| format!("detach iface {iface}: {e}"))?;
         }
-        if let Err(e) = dev.claim_interface(iface) {
-            eprintln!("[usb] claim iface {}: {}", iface, e);
-            return None;
-        }
+        dev.claim_interface(iface).map_err(|e| format!("claim iface {iface}: {e}"))?;
     }
-    eprintln!("[usb] device opened ok");
-    Some(dev)
+    Ok(dev)
 }
 
-pub fn send_frame(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8]) -> bool {
-    let n = (data.len() + PAYLOAD - 1) / PAYLOAD;
-    for j in 0..n {
-        let off = j * PAYLOAD;
-        let chunk = &data[off..(off + PAYLOAD).min(data.len())];
-        let mut pkt = vec![0u8; PKT];
-        pkt[0] = 0x08;
+/// Whether the device behind `dev` is still enumerated on the bus.
+pub fn still_connected(dev: &Handle) -> bool {
+    let d = dev.device();
+    rusb::devices()
+        .map(|list| list.iter().any(|x| x.bus_number() == d.bus_number() && x.address() == d.address()))
+        .unwrap_or(true)
+}
+
+fn write_all(dev: &Handle, ep: u8, buf: &[u8]) -> Result<()> {
+    let n = dev.write_interrupt(ep, buf, WRITE_TIMEOUT)?;
+    if n != buf.len() {
+        return Err(Error::other(format!("short write on ep 0x{ep:02x}: {n}/{} bytes", buf.len())));
+    }
+    Ok(())
+}
+
+fn ctrl_packet(cmd: u8, seq: u8, flags: u8) -> [u8; CTRL_PKT] {
+    let mut p = [0u8; CTRL_PKT];
+    p[0] = cmd;
+    p[1] = seq;
+    p[3] = flags;
+    p
+}
+
+/// Read one reply and require it to echo `cmd`.
+fn expect_ack(dev: &Handle, cmd: u8) -> Result<()> {
+    let mut r = [0u8; CTRL_PKT];
+    match dev.read_interrupt(EP_CTRL_IN, &mut r, ACK_TIMEOUT) {
+        Ok(n) if n > 0 && r[0] == cmd => Ok(()),
+        Ok(n) => Err(Error::other(format!("unexpected reply to command 0x{cmd:02x}: {:02x?}", &r[..n.min(4)]))),
+        Err(rusb::Error::Timeout) => Err(Error::other(format!("no reply to command 0x{cmd:02x}"))),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Discard stale replies (e.g. from earlier screen on/off commands) so they
+/// are not mistaken for the replies of the upload that follows.
+fn drain_ctrl_replies(dev: &Handle) {
+    let mut r = [0u8; CTRL_PKT];
+    for _ in 0..8 {
+        if dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(20)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Stream one JPEG frame (volatile — nothing is written to flash).
+pub fn send_frame(dev: &Handle, jpeg: &[u8]) -> Result<()> {
+    if jpeg.is_empty() || jpeg.len() > MAX_FRAME_BYTES {
+        return Err(Error::other(format!("frame size {} out of range", jpeg.len())));
+    }
+    let n = jpeg.len().div_ceil(FRAME_PAYLOAD);
+    let mut pkt = [0u8; FRAME_PKT];
+    for (j, chunk) in jpeg.chunks(FRAME_PAYLOAD).enumerate() {
+        pkt.fill(0);
+        pkt[0] = CMD_FRAME;
         pkt[1] = if j == 0 { n as u8 } else { ((j - 1) % 0x15) as u8 + 1 };
-        pkt[3] = if j == 0 { 0x80 } else { 0x00 };
+        pkt[3] = if j == 0 { FLAG_FIRST } else { 0 };
         pkt[4..4 + chunk.len()].copy_from_slice(chunk);
-        if dev.write_interrupt(EP_OUT, &pkt, Duration::from_secs(2)).is_err() {
-            return false;
-        }
+        write_all(dev, EP_FRAME_OUT, &pkt)?;
     }
-    // drain response (required or device locks up)
+    // Drain the per-frame response; the device locks up if this is skipped.
     let mut r = [0u8; 16];
-    let _ = dev.read_interrupt(EP_IN, &mut r, Duration::from_millis(1));
-    true
+    let _ = dev.read_interrupt(EP_FRAME_IN, &mut r, Duration::from_millis(1));
+    Ok(())
 }
 
-pub fn screen_on(dev: &DeviceHandle<rusb::GlobalContext>) {
-    let mut p = vec![0u8; CTRL];
-    p[0] = 0x12; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80; p[4] = 0x64;
-    let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
+/// Turn the backlight on or off (not persisted across power cycles).
+pub fn set_screen(dev: &Handle, on: bool) -> Result<()> {
+    let mut p = ctrl_packet(CMD_SCREEN, 1, FLAG_FIRST);
+    p[4] = if on { BRIGHTNESS_ON } else { 0 };
+    write_all(dev, EP_CTRL_OUT, &p)
 }
 
-pub fn screen_off(dev: &DeviceHandle<rusb::GlobalContext>) {
-    let mut p = vec![0u8; CTRL];
-    p[0] = 0x12; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80; p[4] = 0x00;
-    let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
-}
+/// Write `data` to a flash slot.
+///
+/// The caller must validate `data` first (`shared::validate_standby_jpeg` /
+/// `shared::validate_boot_container`). Every step up to the last chunk must be
+/// acknowledged by the device; on any failure the upload stops and the boot
+/// commit is never sent. For the boot slot the device keeps writing flash for
+/// roughly `shared::BOOT_FLASH_SETTLE` after this returns.
+pub fn upload(dev: &Handle, slot: Slot, data: &[u8]) -> Result<()> {
+    let size = u32::try_from(data.len()).map_err(|_| Error::other("payload too large"))?;
+    if size == 0 {
+        return Err(Error::other("empty payload"));
+    }
 
-pub fn upload_boot_animation(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8]) -> Result<(), String> {
-    upload_impl(dev, data, 1)
-}
+    drain_ctrl_replies(dev);
 
-pub fn upload_standby(dev: &DeviceHandle<rusb::GlobalContext>, jpeg: &[u8]) -> Result<(), String> {
-    upload_impl(dev, jpeg, 0)
-}
+    // Pre-finalize: closes any transfer an interrupted upload left open.
+    write_all(dev, EP_CTRL_OUT, &ctrl_packet(CMD_FINALIZE, 1, FLAG_FIRST))?;
+    expect_ack(dev, CMD_FINALIZE)?;
 
-fn upload_impl(dev: &DeviceHandle<rusb::GlobalContext>, data: &[u8], kind: u32) -> Result<(), String> {
-    const CHUNK: usize = 10240;
-    const HDR_DATA: usize = 424;
-    const PKT_DATA: usize = 436;
-    let sz = data.len();
+    let mut init = ctrl_packet(CMD_INIT, 1, FLAG_FIRST);
+    init[4..8].copy_from_slice(&(slot as u32).to_le_bytes());
+    init[8..12].copy_from_slice(&size.to_le_bytes());
+    write_all(dev, EP_CTRL_OUT, &init)?;
+    expect_ack(dev, CMD_INIT)?;
 
-    // Pre-finalize
-    let mut p = vec![0u8; CTRL];
-    p[0] = 0x82; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
-    let _ = dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2));
-    let mut r = vec![0u8; CTRL];
-    let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(200));
+    for (i, chunk) in data.chunks(UPLOAD_CHUNK).enumerate() {
+        let offset = i * UPLOAD_CHUNK;
+        let (head, rest) = chunk.split_at(CHUNK_HDR_DATA.min(chunk.len()));
+        let npkt = 1 + rest.len().div_ceil(CHUNK_PKT_DATA); // ≤ 25
+        let progress = ((offset + chunk.len()) as u64 * 100 / u64::from(size)) as u32;
 
-    // INIT — kind=0 for standby, kind=1 for boot animation
-    let mut p = vec![0u8; CTRL];
-    p[0] = 0x0a; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
-    p[4..8].copy_from_slice(&kind.to_le_bytes());
-    p[8..12].copy_from_slice(&(sz as u32).to_le_bytes());
-    dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-    let mut r = vec![0u8; CTRL];
-    let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
-
-    // Chunks
-    let mut offset = 0usize;
-    while offset < sz {
-        let this_chunk = CHUNK.min(sz - offset);
-        let copy_len = HDR_DATA.min(this_chunk);
-        let data_pkts = if this_chunk > HDR_DATA {
-            (this_chunk - HDR_DATA + PKT_DATA - 1) / PKT_DATA
-        } else { 0 };
-        let npkt = (1 + data_pkts) as u8;
-        let progress = (((offset + this_chunk) as u64 * 100) / sz as u64) as u32;
-
-        let mut p = vec![0u8; CTRL];
-        p[0] = 0x0b; p[1] = npkt; p[2] = 0x00; p[3] = 0x80;
+        let mut p = ctrl_packet(CMD_CHUNK, npkt as u8, FLAG_FIRST);
         p[4..8].copy_from_slice(&(offset as u32).to_le_bytes());
-        p[8..12].copy_from_slice(&(this_chunk as u32).to_le_bytes());
+        p[8..12].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
         p[12..16].copy_from_slice(&progress.to_le_bytes());
-        p[16..16 + copy_len].copy_from_slice(&data[offset..offset + copy_len]);
-        dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+        p[16..16 + head.len()].copy_from_slice(head);
+        write_all(dev, EP_CTRL_OUT, &p)?;
 
-        let mut data_off = offset + copy_len;
-        let mut remaining = this_chunk - copy_len;
-        let mut seq = 1u8;
-        while remaining > 0 {
-            let n = PKT_DATA.min(remaining);
-            let mut p = vec![0u8; CTRL];
-            p[0] = 0x0b; p[1] = seq; p[2] = 0x00; p[3] = 0x00;
-            p[4..4 + n].copy_from_slice(&data[data_off..data_off + n]);
-            dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-            data_off += n;
-            remaining -= n;
-            seq += 1;
+        for (k, part) in rest.chunks(CHUNK_PKT_DATA).enumerate() {
+            let mut p = ctrl_packet(CMD_CHUNK, (k + 1) as u8, 0);
+            p[4..4 + part.len()].copy_from_slice(part);
+            write_all(dev, EP_CTRL_OUT, &p)?;
         }
 
-        let mut r = vec![0u8; CTRL];
-        let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
-        offset += this_chunk;
+        expect_ack(dev, CMD_CHUNK).map_err(|e| Error { msg: format!("chunk at offset {offset}: {}", e.msg), ..e })?;
     }
 
-    // Commit (boot animation only) — CMD 0x14 triggers device to burn uploaded data to flash.
-    // Not used for standby uploads. Byte[4] = 0x62 matches Windows app traces.
-    // After this, the device takes ~17s to write flash; poll CMD 0x82 until not busy.
-    if kind == 1 {
-        let mut p = vec![0u8; CTRL];
-        p[0] = 0x14; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80; p[4] = 0x62;
-        dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-        let mut r = vec![0u8; CTRL];
+    if slot == Slot::Boot {
+        // Commit: the device burns the uploaded data to the boot slot.
+        // Fire-and-forget — the device sends no reply.
+        let mut p = ctrl_packet(CMD_COMMIT, 1, FLAG_FIRST);
+        p[4] = COMMIT_ARG;
+        write_all(dev, EP_CTRL_OUT, &p)?;
+        let mut r = [0u8; CTRL_PKT];
         let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
-
-        // No polling needed — Windows app traces show CMD 0x14 → FINALIZE immediately.
-        // All polls in testing returned 82 01 00 80 with no busy indication.
     }
 
-    // Finalize
-    let mut p = vec![0u8; CTRL];
-    p[0] = 0x82; p[1] = 0x01; p[2] = 0x00; p[3] = 0x80;
-    dev.write_interrupt(EP_CTRL, &p, Duration::from_secs(2)).map_err(|e| e.to_string())?;
-    let mut r = vec![0u8; CTRL];
-    let _ = dev.read_interrupt(EP_CTRL_IN, &mut r, Duration::from_millis(500));
+    write_all(dev, EP_CTRL_OUT, &ctrl_packet(CMD_FINALIZE, 1, FLAG_FIRST))?;
+    if let Err(e) = expect_ack(dev, CMD_FINALIZE) {
+        eprintln!("[usb] finalize: {e} (data already sent)");
+    }
     Ok(())
 }
