@@ -12,3 +12,8 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Device captures / build artifacts that should never be committed
+*.pcap
+*.pcapng
+*.bootanim

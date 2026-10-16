@@ -23,7 +23,7 @@ Each frame must be:
 | Chroma subsampling | **4:4:4** (YCbCr — any other value corrupts the lower half of the display) |
 | JFIF version | 1.1 |
 | DPI | 96×96 |
-| Max size | ~20 KB (quality ~25) for 60 fps headroom |
+| Max size | ~20 KB (quality starts at 25, stepped down to 5 until it fits) |
 
 The extraction script uses Pillow:
 
@@ -64,13 +64,12 @@ After all packets for a single frame are sent, read 16 bytes from EP `0x84` with
 The daemon schedules frames using `Instant::now()`:
 
 ```rust
-if now >= state.next_frame {
-    usb::send_frame(dev, &frames[idx]);
-    state.next_frame = now + Duration::from_secs_f32(1.0 / fps);
-}
+usb::send_frame(dev, &frames[idx])?;
+next += period;                      // drift-free pacing
+if next < now { next = now + period } // fell behind: skip, don't burst
 ```
 
-The loop sleeps up to `min(time_to_next_frame, 5ms)` so USB commands remain responsive during playback.
+Between frames the USB thread blocks on its command channel with a timeout equal to the time until the next frame, so commands are handled immediately and an idle daemon does not wake up needlessly. FPS is clamped to 1–30 by the daemon.
 
 ---
 
@@ -84,28 +83,27 @@ GIF file
                  └─ save f00001.jpg … f00060.jpg
 ```
 
-Frame count is capped at 60. If the GIF has more frames, they are sampled uniformly:
+Frame count is capped at 60. If the GIF has more frames, they are sampled uniformly. Frames are decoded one at a time (`img.seek(i)`), so long GIFs never have to fit in memory:
 
 ```python
-step = max(len(frames) // 60, 1)
-sel = frames[::step][:60]
+step = max(n_frames // 60, 1)
+wanted = set(range(0, n_frames, step)[:60])
 ```
 
-FPS is derived from the GIF's frame durations:
+FPS is derived from the GIF's frame durations and clamped to 5–20:
 
 ```python
-total_ms = sum(f.info.get('duration', 100) for f in frames)
-fps = min(max(1000.0 * len(frames) / total_ms, 5.0), 60.0)
+fps = min(max(1000.0 * n_frames / total_ms, 5.0), 20.0)
 ```
 
 ---
 
 ## Rotation
 
-Rotation is stored on the `Video` struct (`rotation: i32`, multiples of 90°). When the user changes rotation, the daemon re-sends frames from a `-rotated` copy of the frames directory. Rotated copies are generated on demand via Pillow:
+Rotation is stored on the `Video` struct (`rotation: i32`, multiples of 90°). When the video is played with a non-zero rotation, the GUI first generates a `-rotated` copy of the frames directory (in the background) and the daemon streams from that copy:
 
 ```python
 frame.rotate(-rotation, expand=False)
 ```
 
-Rotated frames are cached in `frames/<uuid>-rotated/` so subsequent plays of the same rotation are instant.
+Rotated frames are cached in `frames/<uuid>-rotated/` so subsequent plays of the same rotation are instant. Changing the rotation or deleting the video removes the cache.

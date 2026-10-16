@@ -36,7 +36,7 @@ Packet payloads were decoded manually and by comparing multiple captures. Patter
 
 ### 4. Validation
 
-Each discovered protocol element was validated by reimplementing it in Rust and testing against the real device. The `src/bin/test_boot.rs` tool was used extensively for boot animation protocol validation.
+Each discovered protocol element was validated by reimplementing it in Rust and testing against the real device. The `test_boot` tool (now `examples/test_boot.rs`) was used extensively for boot animation protocol validation.
 
 ---
 
@@ -48,7 +48,7 @@ Each discovered protocol element was validated by reimplementing it in Rust and 
 | 1 | `0x84` | IN | 16 B | Frame drain (required after each frame) |
 | 0 | `0x01` | OUT | 440 B | Control commands |
 | 0 | `0x82` | IN | 440 B | ACK (echo of command byte at `[0]`) |
-| 0 | `0x81` | IN | 13 B | Status (not used) |
+| 0 | `0x81` | IN | 13 B | Status (seen in early traces; not present on every unit, not used) |
 
 ---
 
@@ -117,7 +117,9 @@ After the last chunk, boot animation uploads send a commit command that triggers
 [0x14, 0x01, 0x00, 0x80, 0x62, 0x00…]
 ```
 
-This is **fire-and-forget** — EP `0x82` returns 0 bytes. Confirmed from traces and empirically: no ACK is generated. FINALIZE is sent immediately after without waiting.
+This is **fire-and-forget** — EP `0x82` returns 0 bytes. Confirmed from traces and empirically: no ACK is generated. FINALIZE is sent immediately after, as the Windows app does. The device keeps writing flash for roughly 15–30 s afterwards, so the daemon sends nothing to the device for 30 s and only then reports success.
+
+The meaning of `0x62`, and whether the firmware bounds-checks the INIT size, are unknown. The app therefore validates every container (see [boot-animation.md](boot-animation.md)) and caps it at 1.25 MiB, close to the 1,238,420-byte known-good container from the Windows trace.
 
 The byte `0x62` at position `[4]` was confirmed by iterating values 0x60–0x90 with a probe tool and observing which value matched the Windows trace.
 
@@ -143,8 +145,9 @@ tshark -r upload_boot.pcapng \
   -Y "usb.endpoint_address==0x01 && usb.transfer_type==1" \
   -T fields -e usb.capdata > chunks.txt
 
-# Reassemble the data payload (skip 16-byte chunk headers)
-python3 reassemble.py chunks.txt > container.bin
+# Reassemble the data payload: concatenate bytes [16:440] of each chunk
+# header packet (flag 0x80) and bytes [4:440] of each continuation packet,
+# trimming each chunk to the chunk_size in header bytes [8:12].
 
 # Inspect the header
 xxd container.bin | head -4

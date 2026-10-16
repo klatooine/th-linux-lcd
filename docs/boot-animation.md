@@ -8,9 +8,10 @@ The boot animation plays automatically when the device is powered on, before the
 
 1. **Import**: A GIF is selected. Python/Pillow extracts up to 40 frames and encodes them as 480×480 JPEGs with 4:2:0 subsampling.
 2. **Build container**: The frames are packed into the `Update_Boot_GIF` binary format with a checksum header, frame table, and trailer.
-3. **Upload**: The GUI sends an `UploadBoot` command. The daemon reads the `.bootanim` file and transmits it using the kind=1 upload protocol.
-4. **Flash**: After all chunks are sent, CMD `0x14` triggers the device to burn the data to the boot flash slot. A `Finalize` (CMD `0x82`) completes the transaction.
-5. **Result**: Power cycle the device — the animation plays before the OS connects.
+3. **Validate**: The daemon checks the container byte-for-byte (magic, header fields, checksum, 40 frames, timing ≥ 80 ms, every frame table entry, every frame is a JPEG, trailer) and that it is at most 1.25 MiB. An invalid container is refused before any USB traffic.
+4. **Upload**: The daemon transmits it using the kind=1 upload protocol. INIT and every chunk must be acknowledged; on any failure the upload stops and the commit is **not** sent.
+5. **Flash**: CMD `0x14` triggers the device to burn the data to the boot flash slot, then `Finalize` (CMD `0x82`). The daemon then waits 30 s without talking to the device (status **WRITING FLASH**) before reporting success. Stopping the daemon during this time is deferred until it finishes.
+6. **Result**: Power cycle the device — the animation plays before the OS connects.
 
 ---
 
@@ -22,8 +23,9 @@ The boot animation plays automatically when the device is powered on, before the
 | Chroma subsampling | **4:2:0** (`subsampling=2` in Pillow) |
 | JFIF version | 1.1 |
 | DPI | 96×96 |
-| Encoding quality | 75 |
-| Max frames | 40 |
+| Encoding quality | 75, stepped down (to 20) until each frame ≤ 31 KiB |
+| Frames | exactly 40 (shorter GIFs are padded by repeating the last frame) |
+| Max container size | 1.25 MiB (app limit; known-good container is 1,238,420 bytes) |
 | Max FPS | **12.5 fps** (timing byte ≥ 80 ms — firmware rejects faster containers) |
 
 > The subsampling is opposite to standby images. Boot frames must use 4:2:0; standby images must use 4:4:4.
@@ -102,7 +104,7 @@ The boot upload uses the same chunked protocol as standby (kind=0) with two diff
 5. Finalize:      CMD 0x82  → ACK on EP 0x82
 ```
 
-> CMD `0x14` is **fire-and-forget**. The device returns 0 bytes on EP `0x82`. Sending FINALIZE immediately after is correct — no polling required.
+> CMD `0x14` is **fire-and-forget**. The device returns 0 bytes on EP `0x82`. FINALIZE follows immediately (as in the Windows trace); the device then needs ~15–30 s to finish writing flash. **Do not unplug or power off during that time.**
 
 ---
 
@@ -118,16 +120,15 @@ frame.rotate(-rotation, expand=False)
 
 ## Testing tool
 
-`src/bin/test_boot.rs` is a standalone upload tool that bypasses the daemon:
+`examples/test_boot.rs` is a standalone upload tool that bypasses the daemon (stop it first with `systemctl --user stop th-linux-lcd`). It is not built or installed by default:
 
 ```bash
-cargo build --bin test_boot
-./target/debug/test_boot animation.gif
-./target/debug/test_boot --binary container.bootanim
-./target/debug/test_boot animation.gif --dry-run
+cargo run --example test_boot -- animation.gif --dry-run
+cargo run --example test_boot -- animation.gif
+cargo run --example test_boot -- --binary container.bootanim
 ```
 
-It prints per-chunk progress, ACK bytes, and container structure for debugging.
+It uses the same container builder, validation and upload code as the app, prints the container structure, and asks for confirmation (`--yes` to skip) before writing.
 
 ---
 

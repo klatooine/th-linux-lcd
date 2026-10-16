@@ -9,7 +9,7 @@
 | GUI | `th-linux-lcd` | Renders the UI, sends commands over Unix socket |
 | Daemon | `th-linux-lcd --daemon` | Owns the USB device, streams frames, handles uploads |
 
-The GUI launches the daemon automatically on startup if the socket is not present.
+The GUI starts the daemon on startup if it is not reachable — via `systemctl --user start th-linux-lcd` when the service is installed, otherwise by spawning `th-linux-lcd --daemon`. Only one daemon can run per user: it holds an exclusive lock on `$XDG_RUNTIME_DIR/th-lcd.lock`.
 
 ---
 
@@ -73,24 +73,31 @@ All messages are newline-delimited JSON. The GUI opens a fresh TCP-like connecti
 
 ### Timeouts
 
-| Command | Socket read timeout |
-|---------|-------------------|
-| Most commands | 30 s |
-| `UploadBoot` | 120 s (flash write takes ~15 s) |
+| Command | GUI waits | Daemon waits for USB thread |
+|---------|-----------|-----------------------------|
+| Most commands | 10 s | 10 s |
+| `UploadStandby` / `UploadBoot` | 210 s | 180 s (transfer + 30 s flash settle for boot) |
+
+Requests are capped at 64 KiB per connection and 16 concurrent connections. Commands are queued with `try_send`; a full queue returns "busy" instead of blocking. An upload that cannot start within 10 s is cancelled rather than written to flash later.
+
+### Validation
+
+The daemon validates everything it receives before touching the device: ids must be UUIDs, fps is clamped to 1–30, `frame_count` to 1–60, frame files are size-limited, and upload files are size-checked before being read and then fully validated (`shared::validate_standby_jpeg`, `shared::validate_boot_container`). The socket lives in the per-user `$XDG_RUNTIME_DIR` (mode 0700) with mode 0600; there is no `/tmp` fallback.
 
 ---
 
 ## USB thread
 
-The USB thread runs a tight loop:
+The USB thread owns the device handle and runs an event loop:
 
-1. If no device: call `usb::open()`, sleep 2 s on failure
-2. Drain all pending `UsbCmd` messages (non-blocking `try_recv`)
-3. Update shared `DaemonStatus` (Arc<Mutex<>>)
-4. If streaming and frame is due: send frame via `usb::send_frame()`
-5. Sleep up to next frame time (max 5 ms) or 50 ms if idle
+1. If no device: try `usb::open()` every 2 s (errors are logged only when they change). While idle, check every 5 s that the device is still on the bus.
+2. Publish `DaemonStatus` when it changes.
+3. Block on the command channel until the next frame is due, the flash-settle period ends, or the next reconnect attempt — whichever is first.
+4. If streaming and a frame is due: `usb::send_frame()`; on error drop the handle and reconnect.
 
-Frame timing is wall-clock based (`Instant::now()`) so the loop never over-delivers frames.
+After a boot upload commits, the thread enters a 30 s settle period: no frames, no screen commands, no new uploads; the upload reply is sent when it ends.
+
+On SIGINT/SIGTERM the thread finishes any upload and settle period, then exits; dropping the handle releases the interfaces and re-attaches the kernel driver. If the USB thread panics the process exits non-zero so systemd restarts it.
 
 ---
 
@@ -111,7 +118,7 @@ struct App {
 }
 ```
 
-Background tasks (uploads) run on a separate thread and post results back via a `channel`. The GUI polls the channel each frame and updates the status bar.
+Imports (file picker + Pillow), rotation re-encoding and uploads run on a background thread and post a `BgDone` result back via a `channel`; the UI thread never blocks on them. Uploads to flash require confirmation in a dialog.
 
 ---
 
@@ -120,11 +127,13 @@ Background tasks (uploads) run on a separate thread and post results back via a 
 | File | Responsibility |
 |------|---------------|
 | `src/main.rs` | Entry point — routes to `daemon::run()` or `gui::run()` |
-| `src/daemon.rs` | Unix socket server, USB command dispatch, frame streaming loop |
-| `src/usb.rs` | Low-level USB protocol: open, send_frame, screen_on/off, upload_impl |
-| `src/shared.rs` | IPC types, data structures, persistence, boot container builder |
-| `src/gui.rs` | egui UI: all three tabs, gallery, circle preview, import/rotate logic |
-| `src/bin/test_boot.rs` | Standalone upload tool for testing the boot animation protocol |
+| `src/daemon.rs` | Unix socket server, validation, USB thread (streaming, uploads, reconnect) |
+| `src/gui.rs` | egui UI: all three tabs, gallery, circle preview, background tasks |
+| `src/lib.rs` | Library crate shared by the app and the example |
+| `src/usb.rs` | Low-level USB protocol: open, send_frame, set_screen, upload |
+| `src/shared.rs` | IPC types, data model, atomic persistence, boot container build/validate, unit tests |
+| `src/import.rs` | python3/Pillow import scripts (paths passed as argv) |
+| `examples/test_boot.rs` | Standalone upload tool for debugging the boot animation protocol |
 
 ---
 
@@ -136,9 +145,11 @@ All state is stored in `~/.local/share/th-linux-lcd/`:
 videos.json      Vec<Video>      — imported GIF manifest
 standby.json     Vec<StandbyImage>
 boot.json        Vec<BootAnim>
+autoplay.json    id of the video to resume when the daemon starts
 frames/<id>/     f00001.jpg … fNNNNN.jpg  (extracted animation frames)
+frames/<id>-rotated/                      (cached rotated frames)
 standby/<id>.jpg                          (converted standby images)
 boot/<id>.bootanim                        (Update_Boot_GIF container)
 ```
 
-Manifests store base64-encoded 96×96 JPEG thumbnails inline to avoid extra disk reads on startup.
+Manifests store base64-encoded 96×96 JPEG thumbnails inline to avoid extra disk reads on startup. They are written atomically (temp file + fsync + rename). A manifest that fails to parse is copied to `*.json.corrupt` and reported in the status bar instead of being silently overwritten.

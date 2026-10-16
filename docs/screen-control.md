@@ -38,7 +38,7 @@ Byte 4:  0x00   ← brightness = 0
 Byte 5…: 0x00
 ```
 
-No ACK is read for these commands — they are fire-and-forget.
+The daemon does not wait for a reply. Any pending replies on EP `0x82` are drained before every upload so they cannot be mistaken for upload acknowledgements.
 
 ---
 

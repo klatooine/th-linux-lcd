@@ -8,7 +8,8 @@ The standby image is a static JPEG stored in the device's flash memory. It is di
 
 1. **Import**: An image (JPEG, PNG, or GIF) is selected. Python/Pillow resizes it to 480×480 and encodes it as a JPEG with the correct subsampling.
 2. **Upload**: The GUI sends an `UploadStandby` command to the daemon with the path to the encoded JPEG.
-3. **Flash write**: The daemon reads the JPEG and transmits it to the device using the upload protocol (kind=0).
+3. **Validate**: The daemon checks the file is a 480×480 JPEG no larger than 256 KiB. Anything else is refused before any USB traffic.
+4. **Flash write**: The daemon transmits it to the device using the upload protocol (kind=0). Every step must be acknowledged by the device; on any failure the upload stops.
 
 ---
 
@@ -20,8 +21,8 @@ The standby image is a static JPEG stored in the device's flash memory. It is di
 | Chroma subsampling | **4:4:4** (`subsampling=0` in Pillow) |
 | JFIF version | 1.1 |
 | DPI | 96×96 |
-| Max file size | 5 MB |
-| Starting quality | 85, stepped down until ≤ 5 MB |
+| Max file size | 256 KiB (conservative app limit; the real slot size is unknown) |
+| Starting quality | 85, stepped down to 20 until ≤ 256 KiB |
 
 > **Critical**: the display corrupts the lower half of the image if subsampling is not 4:4:4. This is different from boot animation frames which require 4:2:0.
 
@@ -33,8 +34,10 @@ quality = 85
 while True:
     buf = io.BytesIO()
     img.save(buf, 'JPEG', quality=quality, subsampling=0, dpi=(96, 96))
-    if len(buf.getvalue()) <= 5_000_000 or quality <= 10:
+    if len(buf.getvalue()) <= 256 * 1024:
         break
+    if quality <= 20:
+        raise SystemExit('image too detailed')
     quality -= 5
 ```
 
