@@ -63,7 +63,7 @@ All messages are newline-delimited JSON. The GUI opens a fresh TCP-like connecti
 { "cmd": "ScreenOff" }
 { "cmd": "UploadStandby", "path": "/path/to/image.jpg" }
 { "cmd": "UploadBoot",    "path": "/path/to/anim.bootanim" }
-{ "cmd": "SetOverlay",    "settings": { "enabled": true, "position": "Bottom", "cpu_temp": true, "coolant": true, "gpu_temp": true, "cpu_load": true, "gpu_load": true, "ram": true } }
+{ "cmd": "SetOverlay",    "settings": { "enabled": true, "style": "RetroClock", "size": 1.0, "vertical": 0.78, "cpu_temp": true, "coolant": true, "gpu_temp": true, "cpu_load": true, "gpu_load": true, "ram": true } }
 { "cmd": "Status" }
 ```
 
@@ -143,7 +143,7 @@ Imports (file picker + Pillow), rotation re-encoding and uploads run on a backgr
 | `src/shared.rs` | IPC types, data model, atomic persistence, boot container build/validate, unit tests |
 | `src/import.rs` | python3/Pillow import scripts (paths passed as argv) |
 | `src/metrics.rs` | Host sensors: CPU temp (hwmon), CPU load (`/proc/stat`), RAM (`/proc/meminfo`), GPU (NVML or amdgpu sysfs) |
-| `src/overlay.rs` | Stats overlay: outlined text rendered with the bundled Hack font, blended onto frames, re-encoded as 4:4:4 JPEG |
+| `src/overlay.rs` | Stats overlay: four styles (Terminal outline, Retro seven-segment on a panel, Heavy-metal chrome, Kawaii sticker outline) drawn with coverage masks and the bundled Hack font; size and vertical position adjustable; blended onto frames and re-encoded as 4:4:4 JPEG |
 | `examples/test_boot.rs` | Standalone upload tool for debugging the boot animation protocol |
 
 ---

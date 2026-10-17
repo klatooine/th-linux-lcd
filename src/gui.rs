@@ -17,7 +17,8 @@ use th_linux_lcd::import;
 use th_linux_lcd::overlay::{self, Layer};
 use th_linux_lcd::shared::{
     self, daemon_cmd, decode_thumbnail, frame_file, frames_dir, make_thumbnail, rotated_frames_dir, socket_path,
-    BootAnim, Cmd, DaemonStatus, OnDevice, OverlayPosition, Resp, StandbyImage, Stat, Video,
+    BootAnim, Cmd, DaemonStatus, OnDevice, OverlaySettings, OverlayStyle, Resp, StandbyImage, Stat, Video,
+    OVERLAY_BOTTOM, OVERLAY_SIZE_RANGE, OVERLAY_TOP, OVERLAY_VERTICAL_RANGE,
 };
 use uuid::Uuid;
 
@@ -372,6 +373,9 @@ pub struct App {
     instance: GuiInstance,
     /// Overlay layer for the animation preview, keyed by its text.
     preview_layer: (String, Option<Layer>),
+    /// Overlay settings being edited but not yet confirmed by the daemon
+    /// (e.g. while a slider is dragged), and when they last changed.
+    overlay_edit: Option<(OverlaySettings, Instant)>,
 }
 
 fn daemon_reachable() -> bool {
@@ -563,6 +567,7 @@ impl App {
             confirm: None,
             instance,
             preview_layer: (String::new(), None),
+            overlay_edit: None,
         };
 
         app.ensure_daemon();
@@ -645,16 +650,21 @@ impl App {
 
     /// The stats overlay as the daemon would draw it right now (None when off).
     fn current_overlay(&mut self) -> Option<&Layer> {
-        let st = &self.daemon_status;
-        if !st.overlay.enabled {
+        let settings = self.overlay_settings();
+        if !settings.enabled {
             return None;
         }
-        let rows = overlay::rows(&st.metrics, &st.overlay);
-        let key = overlay::key(&rows, st.overlay.position);
+        let rows = overlay::rows(&self.daemon_status.metrics, &settings);
+        let key = overlay::key(&rows, &settings);
         if key != self.preview_layer.0 {
-            self.preview_layer = (key, Layer::render(&rows, st.overlay.position));
+            self.preview_layer = (key, Layer::render(&rows, &settings));
         }
         self.preview_layer.1.as_ref()
+    }
+
+    /// Overlay settings to show: a pending edit if any, else what the daemon reports.
+    fn overlay_settings(&self) -> OverlaySettings {
+        self.overlay_edit.map_or(self.daemon_status.overlay, |(s, _)| s)
     }
 
     fn set_preview_from_bytes(&mut self, ctx: &egui::Context, name: &str, bytes: &[u8]) {
@@ -728,6 +738,12 @@ impl App {
             }
         }
         if let Ok(Resp::Status(s)) = daemon_cmd(&Cmd::Status) {
+            // Drop a pending overlay edit once the daemon has it (or it went stale).
+            if let Some((edit, at)) = self.overlay_edit {
+                if edit == s.overlay || at.elapsed() > Duration::from_secs(3) {
+                    self.overlay_edit = None;
+                }
+            }
             self.daemon_status = s;
             self.daemon_connected = true;
         } else {
@@ -1310,57 +1326,76 @@ impl App {
         }
     }
 
-    /// "Stats on LCD" card: master switch, position, and one chip per stat
-    /// laid out like the two rows on the display.
+    /// "Stats on LCD" card: switch, style, size, position, and one chip per
+    /// stat laid out like the two rows on the display.
     fn ui_overlay_settings(&mut self, ui: &mut egui::Ui) {
-        let current = self.daemon_status.overlay;
+        let current = self.overlay_settings();
         let mut next = current;
+        let mut commit = false; // send to the daemon now (vs. preview only while dragging)
         let enabled = self.daemon_connected;
+        let on = enabled && next.enabled;
         card_frame().inner_margin(egui::Margin::symmetric(16.0, 12.0)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(mono("STATS ON LCD", 10.5, TEXT_DIM));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if toggle_chip(ui, enabled, if next.enabled { "ON" } else { "OFF" }, next.enabled, 48.0)
-                            .clicked()
-                        {
-                            next.enabled = !next.enabled;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(mono("STATS ON LCD", 10.5, TEXT_DIM));
+                if toggle_chip(ui, enabled, if next.enabled { "ON" } else { "OFF" }, next.enabled, 48.0).clicked() {
+                    next.enabled = !next.enabled;
+                    commit = true;
+                }
+                ui.add_space(10.0);
+                ui.label(mono("STYLE", 9.5, TEXT_FAINT));
+                for style in OverlayStyle::ALL {
+                    if toggle_chip(ui, on, style.name(), next.style == style, 70.0).clicked() {
+                        next.style = style;
+                        commit = true;
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().slider_width = 110.0;
+                ui.label(mono("SIZE", 9.5, TEXT_FAINT));
+                let size = ui.add_enabled(on, egui::Slider::new(&mut next.size, OVERLAY_SIZE_RANGE).show_value(false));
+                ui.label(mono(format!("{:>3.0}%", next.size * 100.0), 9.5, TEXT_DIM));
+                ui.add_space(14.0);
+                ui.label(mono("POSITION", 9.5, TEXT_FAINT));
+                let pos =
+                    ui.add_enabled(on, egui::Slider::new(&mut next.vertical, OVERLAY_VERTICAL_RANGE).show_value(false));
+                for (name, v) in [("TOP", OVERLAY_TOP), ("BOTTOM", OVERLAY_BOTTOM)] {
+                    if toggle_chip(ui, on, name, (next.vertical - v).abs() < 0.005, 56.0).clicked() {
+                        next.vertical = v;
+                        commit = true;
+                    }
+                }
+                // Sliders: preview while dragging, send when released.
+                for r in [&size, &pos] {
+                    if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                        commit = true;
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            let m = self.daemon_status.metrics;
+            for row in Stat::ROWS {
+                ui.horizontal(|ui| {
+                    for stat in row {
+                        // Same short form as on the LCD; full name on hover.
+                        let value = stat.value(&m).unwrap_or_else(|| "--".into());
+                        let label = format!("{} {value}", stat.label());
+                        let chip = toggle_chip(ui, on, &label, next.shows(stat), 92.0);
+                        if chip.on_hover_text(stat.name()).clicked() {
+                            next.toggle(stat);
+                            commit = true;
                         }
-                        let on = enabled && next.enabled;
-                        if toggle_chip(ui, on, "TOP", next.position == OverlayPosition::Top, 56.0).clicked() {
-                            next.position = OverlayPosition::Top;
-                        }
-                        if toggle_chip(ui, on, "BOTTOM", next.position == OverlayPosition::Bottom, 56.0).clicked() {
-                            next.position = OverlayPosition::Bottom;
-                        }
-                    });
-                    ui.add_space(2.0);
-                    ui.label(mono("Drawn on streamed GIFs.", 9.0, TEXT_FAINT));
-                });
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    let m = self.daemon_status.metrics;
-                    for row in Stat::ROWS {
-                        ui.horizontal(|ui| {
-                            for stat in row {
-                                // Same short form as on the LCD; full name on hover.
-                                let value = stat.value(&m).unwrap_or_else(|| "--".into());
-                                let label = format!("{} {value}", stat.label());
-                                let chip = toggle_chip(ui, enabled && next.enabled, &label, next.shows(stat), 84.0);
-                                if chip.on_hover_text(stat.name()).clicked() {
-                                    next.toggle(stat);
-                                }
-                            }
-                        });
                     }
                 });
-            });
+            }
         });
-        if next != current {
-            self.daemon_status.overlay = next; // optimistic; the next status poll confirms
+        if next != current || commit {
+            self.overlay_edit = Some((next, Instant::now()));
             self.preview_texture = None;
+        }
+        if commit {
             self.send(Cmd::SetOverlay { settings: next });
         }
     }

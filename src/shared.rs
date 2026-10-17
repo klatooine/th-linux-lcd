@@ -266,19 +266,51 @@ impl Metrics {
     }
 }
 
+/// Look of the stats overlay.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub enum OverlayPosition {
-    Top,
+pub enum OverlayStyle {
+    /// Green labels, white values, dark outline.
     #[default]
-    Bottom,
+    Terminal,
+    /// Yellow seven-segment digits on a black panel.
+    RetroClock,
+    /// Chrome gradient with a thin dark border.
+    HeavyMetal,
+    /// Bubble-gum pink and mint green with a sticker outline.
+    Kawaii,
 }
 
-/// Which stats are drawn onto streamed frames, and where.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+impl OverlayStyle {
+    pub const ALL: [OverlayStyle; 4] =
+        [OverlayStyle::Terminal, OverlayStyle::RetroClock, OverlayStyle::HeavyMetal, OverlayStyle::Kawaii];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            OverlayStyle::Terminal => "TERMINAL",
+            OverlayStyle::RetroClock => "RETRO",
+            OverlayStyle::HeavyMetal => "METAL",
+            OverlayStyle::Kawaii => "KAWAII",
+        }
+    }
+}
+
+/// Allowed text scale (1.0 = default size).
+pub const OVERLAY_SIZE_RANGE: std::ops::RangeInclusive<f32> = 0.6..=1.6;
+/// Allowed vertical position of the stats block centre (0 = top edge, 1 = bottom edge).
+pub const OVERLAY_VERTICAL_RANGE: std::ops::RangeInclusive<f32> = 0.15..=0.85;
+pub const OVERLAY_TOP: f32 = 0.22;
+pub const OVERLAY_BOTTOM: f32 = 0.78;
+
+/// Which stats are drawn onto streamed frames, and how.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OverlaySettings {
     pub enabled: bool,
-    pub position: OverlayPosition,
+    pub style: OverlayStyle,
+    /// Text scale, see `OVERLAY_SIZE_RANGE`.
+    pub size: f32,
+    /// Vertical centre of the stats block as a fraction of the screen height.
+    pub vertical: f32,
     pub cpu_temp: bool,
     pub coolant: bool,
     pub gpu_temp: bool,
@@ -291,7 +323,9 @@ impl Default for OverlaySettings {
     fn default() -> Self {
         Self {
             enabled: false,
-            position: OverlayPosition::Bottom,
+            style: OverlayStyle::Terminal,
+            size: 1.0,
+            vertical: OVERLAY_BOTTOM,
             cpu_temp: true,
             coolant: true,
             gpu_temp: true,
@@ -303,6 +337,20 @@ impl Default for OverlaySettings {
 }
 
 impl OverlaySettings {
+    /// Clamp size and position into their allowed ranges.
+    pub fn sanitized(mut self) -> Self {
+        let clamp = |v: f32, r: &std::ops::RangeInclusive<f32>, default: f32| {
+            if v.is_finite() {
+                v.clamp(*r.start(), *r.end())
+            } else {
+                default
+            }
+        };
+        self.size = clamp(self.size, &OVERLAY_SIZE_RANGE, 1.0);
+        self.vertical = clamp(self.vertical, &OVERLAY_VERTICAL_RANGE, OVERLAY_BOTTOM);
+        self
+    }
+
     pub fn shows(&self, stat: Stat) -> bool {
         match stat {
             Stat::CpuTemp => self.cpu_temp,
@@ -330,7 +378,11 @@ impl OverlaySettings {
 const OVERLAY_JSON: &str = "overlay.json";
 
 pub fn load_overlay_settings(data: &Path) -> OverlaySettings {
-    fs::read_to_string(data.join(OVERLAY_JSON)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    fs::read_to_string(data.join(OVERLAY_JSON))
+        .ok()
+        .and_then(|s| serde_json::from_str::<OverlaySettings>(&s).ok())
+        .unwrap_or_default()
+        .sanitized()
 }
 
 pub fn save_overlay_settings(data: &Path, settings: &OverlaySettings) -> Result<(), String> {

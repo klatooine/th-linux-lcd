@@ -286,7 +286,7 @@ impl UsbThread {
     /// Re-render the overlay layer if the text or settings changed.
     fn refresh_overlay(&mut self) {
         let key = if self.overlay.enabled {
-            overlay::key(&overlay::rows(&self.metrics, &self.overlay), self.overlay.position)
+            overlay::key(&overlay::rows(&self.metrics, &self.overlay), &self.overlay)
         } else {
             String::new()
         };
@@ -294,7 +294,7 @@ impl UsbThread {
             return;
         }
         self.cache.layer = if self.overlay.enabled {
-            Layer::render(&overlay::rows(&self.metrics, &self.overlay), self.overlay.position)
+            Layer::render(&overlay::rows(&self.metrics, &self.overlay), &self.overlay)
         } else {
             None
         };
@@ -413,6 +413,7 @@ impl UsbThread {
                 }
             }
             UsbCmd::SetOverlay(settings) => {
+                let settings = settings.sanitized();
                 self.overlay = settings;
                 self.refresh_overlay();
                 shared::save_overlay_settings(&data, &settings)

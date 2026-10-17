@@ -17,7 +17,7 @@ Stream GIFs to the screen, set the standby image, and set the boot animation, wi
 - **Standby image**: the picture the screen shows when nothing is streaming.
 - **Boot animation**: the animation shown when the PC powers on.
 - **Screen on/off**, **rotation** in 90° steps, and a **tray icon** that shows the status and opens the app.
-- **Stats on the screen**: CPU, coolant and GPU temperature, plus CPU, GPU and RAM load, drawn at the bottom of the streamed GIF. Each one can be switched on or off in the app.
+- **Stats on the screen**: CPU, coolant and GPU temperature, plus CPU, GPU and RAM load, drawn on top of the streamed GIF. Each one can be switched on or off in the app. There are four styles (Terminal, Retro clock, Heavy metal, Kawaii), and you can adjust the size and position.
 - **Plug and play**: unplug the cooler's USB and streaming pauses; plug it back in and it picks up again.
 
 ## Install
