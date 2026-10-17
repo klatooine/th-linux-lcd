@@ -17,6 +17,8 @@ use th_linux_lcd::shared::{self, Cmd, DaemonStatus, Metrics, OverlaySettings, Re
 use th_linux_lcd::usb;
 
 const DEVICE_RETRY: Duration = Duration::from_secs(2);
+/// Longest wait between reconnect attempts to a device that stopped responding.
+const MAX_DEVICE_RETRY: Duration = Duration::from_secs(60);
 const PRESENCE_CHECK: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -169,6 +171,8 @@ struct UsbThread {
     published: DaemonStatus,
     device: Option<usb::Handle>,
     last_open_attempt: Option<Instant>,
+    /// Current reconnect delay; doubles while the device keeps failing.
+    retry_delay: Duration,
     last_presence_check: Instant,
     last_open_error: Option<String>,
     stream: Option<Stream>,
@@ -191,6 +195,7 @@ impl UsbThread {
             published: DaemonStatus::default(),
             device: None,
             last_open_attempt: None,
+            retry_delay: DEVICE_RETRY,
             last_presence_check: Instant::now(),
             last_open_error: None,
             stream: None,
@@ -243,7 +248,7 @@ impl UsbThread {
         let mut wait = DEVICE_RETRY;
         if self.device.is_none() {
             if let Some(t) = self.last_open_attempt {
-                wait = (t + DEVICE_RETRY).saturating_duration_since(now);
+                wait = (t + self.retry_delay).saturating_duration_since(now);
             }
         } else if let Some(s) = &self.settle {
             wait = wait.min(s.until.saturating_duration_since(now));
@@ -314,7 +319,7 @@ impl UsbThread {
             }
             return;
         }
-        if self.last_open_attempt.is_some_and(|t| now.duration_since(t) < DEVICE_RETRY) {
+        if self.last_open_attempt.is_some_and(|t| now.duration_since(t) < self.retry_delay) {
             return;
         }
         self.last_open_attempt = Some(now);
@@ -447,6 +452,7 @@ impl UsbThread {
                 if self.device.is_none() {
                     eprintln!("[usb] device plugged in");
                     self.last_open_attempt = None; // open on the next loop iteration
+                    self.retry_delay = DEVICE_RETRY;
                 }
                 Ok(())
             }
@@ -497,6 +503,7 @@ impl UsbThread {
         };
         match usb::send_frame(dev, jpeg) {
             Ok(()) => {
+                self.retry_delay = DEVICE_RETRY;
                 s.idx = (s.idx + 1) % s.frames.len();
                 s.next += s.period;
                 if s.next < now {
@@ -504,7 +511,10 @@ impl UsbThread {
                 }
             }
             Err(e) => {
-                eprintln!("[daemon] frame send failed ({e}); reopening device");
+                // Back off so a frozen device is not hammered (each failed attempt
+                // also makes the kernel's HID driver probe it).
+                self.retry_delay = (self.retry_delay * 2).min(MAX_DEVICE_RETRY);
+                eprintln!("[daemon] frame send failed ({e}); reopening device in {:?}", self.retry_delay);
                 self.device = None;
             }
         }

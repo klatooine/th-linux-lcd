@@ -42,6 +42,9 @@ pub const DAEMON_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 pub const CLIENT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(210);
 /// How long the GUI waits for a reply to any other command.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Status polls happen on the GUI thread; keep them short so a stuck daemon
+/// cannot freeze the window.
+pub const STATUS_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// Clamp a frame rate to the streaming range; rejects NaN/inf/≤0.
 pub fn sanitize_fps(fps: f32) -> Option<f32> {
@@ -156,6 +159,7 @@ impl Cmd {
     fn reply_timeout(&self) -> Duration {
         match self {
             Cmd::UploadStandby { .. } | Cmd::UploadBoot { .. } => CLIENT_UPLOAD_TIMEOUT,
+            Cmd::Status => STATUS_TIMEOUT,
             _ => CLIENT_TIMEOUT,
         }
     }
