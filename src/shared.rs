@@ -126,7 +126,8 @@ pub fn frames_dir(data: &Path, id: &str) -> PathBuf {
     data.join("frames").join(id)
 }
 
-/// Cache of rotated frames for a video with non-zero rotation.
+/// Legacy cache of rotated frames (rotation is now applied by the daemon); only
+/// used to clean up old installs.
 pub fn rotated_frames_dir(data: &Path, id: &str) -> PathBuf {
     data.join("frames").join(format!("{id}-rotated"))
 }
@@ -553,6 +554,49 @@ pub fn save_autoplay(data: &Path, id: Option<&str>) -> Result<(), String> {
     }
 }
 
+// ── App settings ──────────────────────────────────────────────────────────────
+
+const SETTINGS_JSON: &str = "settings.json";
+
+/// Settings shared by the GUI and the daemon.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct Settings {
+    /// Clockwise rotation (0/90/180/270) applied to everything sent to the LCD
+    /// (animations, standby image, boot animation) to match how the cooler is
+    /// mounted.
+    pub rotation: i32,
+}
+
+/// Load settings. Before the global setting existed, rotation was per video:
+/// adopt the rotation of the autoplay video (or any rotated video) once.
+pub fn load_settings(data: &Path) -> Settings {
+    let parsed =
+        fs::read_to_string(data.join(SETTINGS_JSON)).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok());
+    let mut s = parsed.unwrap_or_else(|| {
+        let (videos, _) = load_videos(data);
+        let autoplay = load_autoplay(data);
+        let rotation = videos
+            .iter()
+            .find(|v| Some(&v.id) == autoplay.as_ref() && v.rotation != 0)
+            .or_else(|| videos.iter().find(|v| v.rotation != 0))
+            .map_or(0, |v| v.rotation);
+        Settings { rotation }
+    });
+    s.rotation = normalize_rotation(s.rotation);
+    s
+}
+
+pub fn save_settings(data: &Path, settings: &Settings) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    write_atomic(&data.join(SETTINGS_JSON), &json)
+}
+
+/// 0, 90, 180 or 270 (rounds to the nearest quarter turn).
+pub fn normalize_rotation(degrees: i32) -> i32 {
+    ((degrees as f32 / 90.0).round() as i32 * 90).rem_euclid(360)
+}
+
 // ── What is on the device ─────────────────────────────────────────────────────
 
 const ON_DEVICE_JSON: &str = "on_device.json";
@@ -774,8 +818,25 @@ pub fn decode_thumbnail(b64: &str) -> Option<(Vec<u8>, [usize; 2])> {
 
 /// Encode an image (JPEG/PNG bytes) to a base64 96×96 JPEG thumbnail.
 pub fn thumbnail_from_bytes(bytes: &[u8]) -> String {
+    thumbnail_upright(bytes, 0)
+}
+
+/// Rotate an image clockwise by a quarter-turn multiple.
+pub fn rotate_cw(img: image::DynamicImage, degrees: i32) -> image::DynamicImage {
+    match normalize_rotation(degrees) {
+        90 => img.rotate90(),
+        180 => img.rotate180(),
+        270 => img.rotate270(),
+        _ => img,
+    }
+}
+
+/// Thumbnail of an image that was rotated clockwise by `applied` degrees for
+/// the LCD, turned back upright for display in the GUI.
+pub fn thumbnail_upright(bytes: &[u8], applied: i32) -> String {
     use base64::Engine;
     let Ok(img) = image::load_from_memory(bytes) else { return String::new() };
+    let img = rotate_cw(img, 360 - normalize_rotation(applied));
     let small = img.resize(96, 96, image::imageops::FilterType::Lanczos3).to_rgb8();
     let mut buf = Vec::new();
     if small.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg).is_err() {
@@ -897,6 +958,34 @@ mod tests {
         assert_eq!(sanitize_fps(0.01), Some(MIN_STREAM_FPS));
         assert_eq!(sanitize_fps(1000.0), Some(MAX_STREAM_FPS));
         assert_eq!(sanitize_fps(15.0), Some(15.0));
+    }
+
+    #[test]
+    fn rotation_settings_normalise_and_migrate() {
+        assert_eq!(normalize_rotation(-90), 270);
+        assert_eq!(normalize_rotation(450), 90);
+        assert_eq!(normalize_rotation(0), 0);
+        assert_eq!(normalize_rotation(80), 90);
+
+        let dir = std::env::temp_dir().join(format!("th-lcd-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        // No settings yet: adopt the old per-video rotation.
+        let id = uuid::Uuid::new_v4().to_string();
+        let v = Video {
+            id: id.clone(),
+            name: "v".into(),
+            source_path: String::new(),
+            frame_count: 1,
+            fps: 10.0,
+            rotation: 90,
+            thumbnail: String::new(),
+        };
+        save_videos(&dir, &[v]).unwrap();
+        assert_eq!(load_settings(&dir).rotation, 90);
+        // Once saved, the global value wins.
+        save_settings(&dir, &Settings { rotation: 180 }).unwrap();
+        assert_eq!(load_settings(&dir).rotation, 180);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

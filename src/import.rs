@@ -5,8 +5,7 @@
 //! long animation never has to fit in memory.
 
 use crate::shared::{
-    self, frame_file, BOOT_FRAMES, BOOT_FRAME_BUDGET, MAX_BOOT_FPS, MAX_STANDBY_BYTES, MAX_STREAM_FRAMES,
-    STREAM_FRAME_BUDGET,
+    self, BOOT_FRAMES, BOOT_FRAME_BUDGET, MAX_BOOT_FPS, MAX_STANDBY_BYTES, MAX_STREAM_FRAMES, STREAM_FRAME_BUDGET,
 };
 use std::ffi::OsStr;
 use std::fs;
@@ -44,14 +43,17 @@ fps = min(max(1000.0 * total / max(duration, 1), 5.0), 20.0)
 print(json.dumps({"n": written, "fps": fps}))
 "#;
 
-/// argv: src dest budget  — first frame, 480×480, 4:4:4, written atomically.
+/// argv: src dest budget rotation  — first frame, 480×480, rotated clockwise,
+/// 4:4:4, written atomically.
 const STANDBY_SCRIPT: &str = r#"
 import io, os, sys
 from PIL import Image
-src, dest, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, dest, budget, rotation = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 img = Image.open(src)
 img.seek(0)
 img = img.convert('RGB').resize((480, 480), Image.LANCZOS)
+if rotation:
+    img = img.rotate(-rotation, expand=False)
 q = 85
 while True:
     b = io.BytesIO()
@@ -108,28 +110,6 @@ fps = min(max(1000.0 * total / max(duration, 1), 5.0), max_fps)
 print(json.dumps({"n": written, "fps": fps}))
 "#;
 
-/// argv: src dst count rotation budget  — rotates f00001…fNNNNN.jpg into dst.
-const ROTATE_SCRIPT: &str = r#"
-import io, os, sys
-from PIL import Image
-src, dst, count, rot, budget = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-os.makedirs(dst, exist_ok=True)
-for i in range(1, count + 1):
-    p = os.path.join(src, f'f{i:05}.jpg')
-    if not os.path.exists(p):
-        continue
-    img = Image.open(p).rotate(-rot, expand=False)
-    q = 25
-    while True:
-        b = io.BytesIO()
-        img.save(b, 'JPEG', quality=q, subsampling='4:4:4', dpi=(96, 96))
-        if len(b.getvalue()) <= budget or q <= 5:
-            break
-        q -= 5
-    with open(os.path.join(dst, f'f{i:05}.jpg'), 'wb') as f:
-        f.write(b.getvalue())
-"#;
-
 fn run_python(script: &str, args: &[&OsStr]) -> Result<String, String> {
     let out = Command::new("python3")
         .arg("-c")
@@ -184,9 +164,12 @@ pub fn import_video(src: &Path, out_dir: &Path) -> Result<(usize, f32), String> 
     result
 }
 
-/// Convert any image (first frame) to a 480×480 standby JPEG at `dest`.
-pub fn import_standby(src: &Path, dest: &Path) -> Result<(), String> {
-    run_python(STANDBY_SCRIPT, &[src.as_os_str(), dest.as_os_str(), OsStr::new(&MAX_STANDBY_BYTES.to_string())])?;
+/// Convert any image (first frame) to a 480×480 standby JPEG at `dest`,
+/// rotated clockwise by `rotation` degrees (0 when importing into the library).
+pub fn import_standby(src: &Path, dest: &Path, rotation: i32) -> Result<(), String> {
+    let budget = MAX_STANDBY_BYTES.to_string();
+    let rotation = shared::normalize_rotation(rotation).to_string();
+    run_python(STANDBY_SCRIPT, &[src.as_os_str(), dest.as_os_str(), OsStr::new(&budget), OsStr::new(&rotation)])?;
     let data = fs::read(dest).map_err(|e| e.to_string())?;
     shared::validate_standby_jpeg(&data).inspect_err(|_| {
         let _ = fs::remove_file(dest);
@@ -220,30 +203,7 @@ pub fn build_boot_from_gif(src: &Path, rotation: i32, out_path: &Path) -> Result
     let container = shared::build_boot_container(&frames, fps)?;
     shared::validate_boot_container(&container)?;
     shared::write_atomic(out_path, &container)?;
-    let thumb = frames.first().map(|f| shared::thumbnail_from_bytes(f)).unwrap_or_default();
+    // The container holds rotated frames; show the thumbnail upright.
+    let thumb = frames.first().map(|f| shared::thumbnail_upright(f, rotation)).unwrap_or_default();
     Ok((n, fps, thumb))
-}
-
-/// Rotate streaming frames from `src_dir` into `dst_dir` (replaced atomically).
-/// Reuses `dst_dir` if it already holds `count` frames.
-pub fn rotate_frames(src_dir: &Path, dst_dir: &Path, count: usize, rotation: i32) -> Result<(), String> {
-    if (1..=count).all(|i| frame_file(dst_dir, i).exists()) {
-        return Ok(());
-    }
-    let mut tmp_name = dst_dir.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = TempDir(dst_dir.with_file_name(tmp_name));
-    let _ = fs::remove_dir_all(&tmp.0);
-    run_python(
-        ROTATE_SCRIPT,
-        &[
-            src_dir.as_os_str(),
-            tmp.0.as_os_str(),
-            OsStr::new(&count.to_string()),
-            OsStr::new(&rotation.rem_euclid(360).to_string()),
-            OsStr::new(&STREAM_FRAME_BUDGET.to_string()),
-        ],
-    )?;
-    let _ = fs::remove_dir_all(dst_dir);
-    fs::rename(&tmp.0, dst_dir).map_err(|e| e.to_string())
 }

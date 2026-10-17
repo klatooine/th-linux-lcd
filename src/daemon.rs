@@ -301,8 +301,8 @@ impl UsbThread {
 
     /// Re-render the overlay layer if the text or settings changed.
     fn refresh_overlay(&mut self) {
-        // Frames of a rotated video are pre-rotated; rotate the stats the same way
-        // so they stay upright on the screen.
+        // Frames are rotated (with the overlay drawn in) when sent; re-render them
+        // when the overlay text, its settings or the rotation change.
         let rotation = self.stream.as_ref().map_or(0, |s| s.rotation);
         let key = if self.overlay.enabled {
             format!("{}|rot{rotation}", overlay::key(&overlay::rows(&self.metrics, &self.overlay), &self.overlay))
@@ -313,7 +313,7 @@ impl UsbThread {
             return;
         }
         self.cache.layer = if self.overlay.enabled {
-            Layer::render(&overlay::rows(&self.metrics, &self.overlay), &self.overlay).map(|l| l.rotated_cw(rotation))
+            Layer::render(&overlay::rows(&self.metrics, &self.overlay), &self.overlay)
         } else {
             None
         };
@@ -369,13 +369,12 @@ impl UsbThread {
         let Some(id) = shared::load_autoplay(&data) else { return };
         let (videos, _) = shared::load_videos(&data);
         let Some(v) = videos.iter().find(|v| v.id == id) else { return };
-        let dir =
-            if v.rotation != 0 { shared::rotated_frames_dir(&data, &v.id) } else { shared::frames_dir(&data, &v.id) };
-        let frames = load_frames(&dir, v.frame_count);
+        let frames = load_frames(&shared::frames_dir(&data, &v.id), v.frame_count);
+        let rotation = shared::load_settings(&data).rotation;
         let fps = shared::sanitize_fps(v.fps).unwrap_or(15.0);
         if !frames.is_empty() {
             eprintln!("[daemon] autoplay: {} ({} frames @ {fps} fps)", v.name, frames.len());
-            self.stream = Some(Stream::new(frames, fps, v.id.clone(), v.rotation));
+            self.stream = Some(Stream::new(frames, fps, v.id.clone(), rotation));
             self.refresh_overlay();
             self.cache.reset_frames(self.stream.as_ref().map_or(0, |s| s.frames.len()));
         }
@@ -502,19 +501,21 @@ impl UsbThread {
         if now < s.next {
             return;
         }
-        // With the overlay on, send the frame with stats drawn in (rendered once per text change).
+        // With the overlay on or the screen rotated, send the frame with stats drawn
+        // in and rotated (rendered once per change, then cached).
         let OverlayCache { layer, frames, quality, error_logged, .. } = &mut self.cache;
-        if let (Some(layer), Some(slot @ None)) = (layer.as_ref(), frames.get_mut(s.idx)) {
-            *slot = Some(layer.apply_to_jpeg(&s.frames[s.idx], quality).unwrap_or_else(|e| {
+        let processed = layer.is_some() || s.rotation != 0;
+        if let (true, Some(slot @ None)) = (processed, frames.get_mut(s.idx)) {
+            *slot = Some(overlay::compose(&s.frames[s.idx], layer.as_ref(), s.rotation, quality).unwrap_or_else(|e| {
                 if !*error_logged {
-                    eprintln!("[daemon] overlay skipped for a frame: {e}");
+                    eprintln!("[daemon] frame sent unprocessed: {e}");
                     *error_logged = true;
                 }
                 s.frames[s.idx].clone()
             }));
         }
-        let jpeg = match (layer, frames.get(s.idx)) {
-            (Some(_), Some(Some(rendered))) => rendered.as_slice(),
+        let jpeg = match frames.get(s.idx) {
+            Some(Some(rendered)) if processed => rendered.as_slice(),
             _ => s.frames[s.idx].as_slice(),
         };
         match usb::send_frame(dev, jpeg) {
@@ -568,22 +569,19 @@ fn dispatch(cmd: Cmd, tx: &SyncSender<Job>, status: &Mutex<DaemonStatus>) -> Res
             if frame_count == 0 || frame_count > shared::MAX_STREAM_FRAMES {
                 return Err(format!("frame_count must be 1..={}", shared::MAX_STREAM_FRAMES));
             }
+            // Older GUIs sent pre-rotated frames from a cache folder: use the original
+            // frames and the global rotation instead (the daemon rotates now).
+            let data = shared::data_dir();
+            let (frames_dir, rotation) = if Path::new(&frames_dir) == shared::rotated_frames_dir(&data, &id) {
+                (shared::frames_dir(&data, &id).display().to_string(), shared::load_settings(&data).rotation)
+            } else {
+                (frames_dir, rotation)
+            };
             let frames = load_frames(Path::new(&frames_dir), frame_count);
             if frames.is_empty() {
                 return Err(format!("no frames found in {frames_dir}"));
             }
-            // Older GUIs don't send the rotation: if these are the video's rotated
-            // frames, take the rotation from the library.
-            let rotation =
-                if rotation == 0 && Path::new(&frames_dir) == shared::rotated_frames_dir(&shared::data_dir(), &id) {
-                    shared::load_videos(&shared::data_dir()).0.iter().find(|v| v.id == id).map_or(0, |v| v.rotation)
-                } else {
-                    rotation
-                }
-                .rem_euclid(360);
-            if rotation % 90 != 0 {
-                return Err("rotation must be a multiple of 90".into());
-            }
+            let rotation = shared::normalize_rotation(rotation);
             (UsbCmd::Play { frames, fps, id, rotation }, QUICK_REPLY_TIMEOUT)
         }
         Cmd::Stop => (UsbCmd::Stop, QUICK_REPLY_TIMEOUT),

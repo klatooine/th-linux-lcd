@@ -100,10 +100,8 @@ fps = min(max(1000.0 * n_frames / total_ms, 5.0), 20.0)
 
 ## Rotation
 
-Rotation is stored on the `Video` struct (`rotation: i32`, multiples of 90°). When the video is played with a non-zero rotation, the GUI first generates a `-rotated` copy of the frames directory (in the background) and the daemon streams from that copy:
+Rotation is one global setting (`settings.json`, `rotation`: 0/90/180/270 clockwise) that describes how the cooler is mounted. It applies to everything sent to the LCD.
 
-```python
-frame.rotate(-rotation, expand=False)
-```
+For streaming, `Play` carries the original frames plus the rotation. The daemon prepares each frame once with `overlay::compose`: decode, draw the stats overlay upright, rotate the whole frame, re-encode as a 4:4:4 JPEG. The result is cached until the rotation or the overlay text changes, so the stats always turn together with the picture. Changing the rotation in the GUI re-sends the running animation immediately.
 
-Rotated frames are cached in `frames/<uuid>-rotated/` so subsequent plays of the same rotation are instant. Changing the rotation or deleting the video removes the cache.
+(Older versions kept a pre-rotated copy per video in `frames/<uuid>-rotated/`. The GUI deletes those on start.)

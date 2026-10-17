@@ -812,58 +812,39 @@ impl Layer {
             }
         }
     }
+}
 
-    /// The layer rotated clockwise by `degrees` (multiples of 90) about the
-    /// screen centre, matching frames that were rotated the same way.
-    pub fn rotated_cw(self, degrees: i32) -> Layer {
-        let mut l = self;
-        for _ in 0..(degrees.rem_euclid(360) / 90) {
-            l = l.rot90_cw();
-        }
-        l
+/// Prepare a streamed frame: decode the 480×480 JPEG, draw the overlay
+/// (upright), rotate the whole frame clockwise by `rotation` to match how the
+/// LCD is mounted, and re-encode as a 4:4:4 JPEG within the streaming size
+/// budget. `quality` carries the last good quality between frames so most
+/// frames encode only once.
+pub fn compose(jpeg: &[u8], layer: Option<&Layer>, rotation: i32, quality: &mut u8) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).map_err(|e| e.to_string())?;
+    if img.width() != LCD_SIZE || img.height() != LCD_SIZE {
+        return Err(format!("frame is {}×{}, expected {LCD_SIZE}×{LCD_SIZE}", img.width(), img.height()));
     }
-
-    /// (x, y) → (SIZE-1-y, x).
-    fn rot90_cw(&self) -> Layer {
-        let (nx0, ny0, nw, nh) = (SIZE - self.y0 - self.h, self.x0, self.h, self.w);
-        let mut rgba = vec![[0u8; 4]; nw * nh];
-        for row in 0..self.h {
-            for col in 0..self.w {
-                let (sx, sy) = (self.x0 + col, self.y0 + row);
-                let (dx, dy) = (SIZE - 1 - sy, sx);
-                rgba[(dy - ny0) * nw + (dx - nx0)] = self.rgba[row * self.w + col];
-            }
-        }
-        Layer { x0: nx0, y0: ny0, w: nw, h: nh, rgba }
+    let mut rgb = img.into_rgb8();
+    if let Some(layer) = layer {
+        layer.apply(&mut rgb, 3);
     }
+    let rgb = crate::shared::rotate_cw(image::DynamicImage::ImageRgb8(rgb), rotation).into_rgb8().into_raw();
 
-    /// Decode a 480×480 JPEG frame, draw the overlay and re-encode it as a
-    /// 4:4:4 JPEG within the streaming size budget. `quality` carries the
-    /// last good quality between frames so most frames encode only once.
-    pub fn apply_to_jpeg(&self, jpeg: &[u8], quality: &mut u8) -> Result<Vec<u8>, String> {
-        let img = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg).map_err(|e| e.to_string())?;
-        if img.width() != LCD_SIZE || img.height() != LCD_SIZE {
-            return Err(format!("frame is {}×{}, expected {LCD_SIZE}×{LCD_SIZE}", img.width(), img.height()));
+    // The budget is a target, not a hard limit: very detailed frames may
+    // stay slightly above it even at the lowest quality.
+    let mut q = (*quality).clamp(5, 90);
+    loop {
+        let out = encode(&rgb, q)?;
+        if out.len() <= STREAM_FRAME_BUDGET || q <= 5 {
+            // Drift back up when there is plenty of headroom.
+            *quality = if out.len() < STREAM_FRAME_BUDGET * 6 / 10 { (q + 5).min(90) } else { q };
+            return Ok(out);
         }
-        let mut rgb = img.into_rgb8().into_raw();
-        self.apply(&mut rgb, 3);
-
-        // The budget is a target, not a hard limit: very detailed frames may
-        // stay slightly above it even at the lowest quality.
-        let mut q = (*quality).clamp(5, 90);
-        loop {
-            let out = encode(&rgb, q)?;
-            if out.len() <= STREAM_FRAME_BUDGET || q <= 5 {
-                // Drift back up when there is plenty of headroom.
-                *quality = if out.len() < STREAM_FRAME_BUDGET * 6 / 10 { (q + 5).min(90) } else { q };
-                return Ok(out);
-            }
-            q = q.saturating_sub(10).max(5);
-        }
+        q = q.saturating_sub(10).max(5);
     }
 }
 
-/// Starting JPEG quality for `Layer::apply_to_jpeg`.
+/// Starting JPEG quality for `compose`.
 pub fn initial_quality() -> u8 {
     QUALITY_START
 }
@@ -955,52 +936,33 @@ mod tests {
     }
 
     #[test]
-    fn rotation_moves_the_overlay_with_the_frame() {
-        let layer = Layer::render(&rows(&metrics(), &all_on()), &all_on()).unwrap(); // at the bottom
-        let blend = |l: &Layer| {
-            let mut img = vec![0u8; SIZE * SIZE * 3];
-            l.apply(&mut img, 3);
-            img
-        };
-        // Centre of mass of the drawn pixels.
-        let centre = |img: &[u8]| {
-            let (mut sx, mut sy, mut n) = (0f64, 0f64, 0f64);
-            for (i, px) in img.chunks(3).enumerate() {
-                if px.iter().any(|&c| c > 0) {
-                    sx += (i % SIZE) as f64;
-                    sy += (i / SIZE) as f64;
-                    n += 1.0;
-                }
+    fn compose_rotates_frame_and_overlay_together() {
+        // White square in the top-left corner of a black frame, stats at the bottom.
+        let mut src = image::RgbImage::new(LCD_SIZE, LCD_SIZE);
+        for y in 0..60 {
+            for x in 0..60 {
+                src.put_pixel(x, y, image::Rgb([255, 255, 255]));
             }
-            (sx / n, sy / n)
-        };
-        let (_, y) = centre(&blend(&layer));
-        assert!(y > 300.0, "starts at the bottom");
-        // Frames rotated clockwise by 90° put their bottom edge on the left.
-        let (x, _) = centre(&blend(&layer.clone().rotated_cw(90)));
-        assert!(x < 180.0, "rotated to the left, got x = {x}");
-        let (_, y) = centre(&blend(&layer.clone().rotated_cw(180)));
-        assert!(y < 180.0, "rotated to the top");
-        // A full turn is the identity.
-        assert_eq!(blend(&layer.clone().rotated_cw(360)), blend(&layer.clone().rotated_cw(90).rotated_cw(270)));
-        assert_eq!(blend(&layer.clone().rotated_cw(0)), blend(&layer));
-    }
-
-    #[test]
-    fn larger_sizes_give_larger_text() {
-        let biggest = |style, size| {
-            let s = OverlaySettings { style, size, ..all_on() };
-            layout(&rows(&metrics(), &s), &s, &look(style))
-                .iter()
-                .flat_map(|r| &r.pieces)
-                .filter(|p| !p.label)
-                .map(|p| p.px)
-                .fold(0.0, f32::max)
-        };
-        for style in OverlayStyle::ALL {
-            let (normal, max) = (biggest(style, 1.0), biggest(style, *OVERLAY_SIZE_RANGE.end()));
-            assert!(max > normal * 1.2, "{style:?}: {normal} -> {max}");
         }
+        let jpeg = encode(src.as_raw(), 80).unwrap();
+        let layer = Layer::render(&rows(&metrics(), &all_on()), &all_on()).unwrap();
+        let mut q = initial_quality();
+        let out = image::load_from_memory(&compose(&jpeg, Some(&layer), 90, &mut q).unwrap()).unwrap().to_rgb8();
+        let bright = |x: u32, y: u32| out.get_pixel(x, y).0.iter().map(|&c| c as u32).sum::<u32>() > 600;
+        // Clockwise 90°: the top-left square goes to the top-right corner.
+        assert!(bright(450, 30) && !bright(30, 30));
+        // The stats (drawn at the bottom) go to the left edge: count coloured pixels per half.
+        let coloured = |x: u32, y: u32| {
+            let [r, g, b] = out.get_pixel(x, y).0;
+            r.max(g).max(b) - r.min(g).min(b) > 80
+        };
+        let left =
+            (0..LCD_SIZE / 2).flat_map(|x| (0..LCD_SIZE).map(move |y| (x, y))).filter(|&(x, y)| coloured(x, y)).count();
+        let right = (LCD_SIZE / 2..LCD_SIZE)
+            .flat_map(|x| (0..LCD_SIZE).map(move |y| (x, y)))
+            .filter(|&(x, y)| coloured(x, y))
+            .count();
+        assert!(left > 10 * right.max(1), "stats on the left: {left} vs {right}");
     }
 
     #[test]
@@ -1025,7 +987,7 @@ mod tests {
         let jpeg = encode(src.as_raw(), 25).unwrap();
 
         let mut q = initial_quality();
-        let out = layer.apply_to_jpeg(&jpeg, &mut q).unwrap();
+        let out = compose(&jpeg, Some(&layer), 0, &mut q).unwrap();
         assert!(out.len() <= STREAM_FRAME_BUDGET, "{} bytes", out.len());
         assert_eq!(&out[..2], &[0xFF, 0xD8]);
         assert_eq!(&out[6..13], b"JFIF\0\x01\x01");

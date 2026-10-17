@@ -330,12 +330,11 @@ enum UploadTarget {
 
 /// Result of work done off the UI thread. `Ok(None)` means the user cancelled.
 enum BgDone {
-    Uploaded(Result<(), String>, &'static str, UploadTarget),
+    /// Upload result; for a boot animation, the entry rebuilt at the current rotation (if it was).
+    Uploaded(Result<Option<BootAnim>, String>, &'static str, UploadTarget),
     VideoImported(Result<Option<Video>, String>),
     StandbyImported(Result<Option<StandbyImage>, String>),
     BootImported(Result<Option<BootAnim>, String>),
-    BootRotated(Result<BootAnim, String>),
-    PlayReady(Result<Cmd, String>),
 }
 
 struct BgTask {
@@ -345,7 +344,7 @@ struct BgTask {
 
 /// An action awaiting confirmation in a dialog.
 enum Confirm {
-    Upload { cmd: Cmd, what: &'static str, done_msg: &'static str, target: UploadTarget },
+    Upload { what: &'static str, done_msg: &'static str, target: UploadTarget },
     Delete { tab: Tab, id: String, name: String },
 }
 
@@ -355,6 +354,8 @@ pub struct App {
     standby: Vec<StandbyImage>,
     boot_anims: Vec<BootAnim>,
     on_device: OnDevice,
+    /// Global settings (screen rotation).
+    settings: shared::Settings,
     tab: Tab,
     selected_video: Option<String>,
     selected_standby: Option<String>,
@@ -429,7 +430,7 @@ fn import_standby_task(data: &Path) -> Result<Option<StandbyImage>, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let id = Uuid::new_v4().to_string();
     let dest = dir.join(format!("{id}.jpg"));
-    import::import_standby(&src, &dest)?;
+    import::import_standby(&src, &dest, 0)?;
     Ok(Some(StandbyImage {
         name: file_stem(&src),
         path: dest.display().to_string(),
@@ -546,6 +547,7 @@ impl App {
 
         let mut app = App {
             on_device: shared::load_on_device(&data),
+            settings: shared::load_settings(&data),
             selected_video: videos.first().map(|v| v.id.clone()),
             selected_standby: standby.first().map(|i| i.id.clone()),
             selected_boot: boot_anims.first().map(|a| a.id.clone()),
@@ -570,6 +572,12 @@ impl App {
             overlay_edit: None,
         };
 
+        // Rotation is now applied by the daemon; drop old pre-rotated frame caches.
+        for v in &app.videos {
+            if shared::is_valid_id(&v.id) {
+                let _ = std::fs::remove_dir_all(rotated_frames_dir(&app.data_dir, &v.id));
+            }
+        }
         app.ensure_daemon();
         if !warnings.is_empty() {
             app.status_msg = format!("Warning: {}", warnings.join("; "));
@@ -799,8 +807,16 @@ impl App {
     fn finish_bg(&mut self, done: BgDone) {
         self.last_status_poll = None;
         match done {
-            BgDone::Uploaded(Ok(()), msg, target) => {
+            BgDone::Uploaded(Ok(rebuilt), msg, target) => {
                 self.status_msg = msg.into();
+                if let Some(anim) = rebuilt {
+                    self.thumb_cache.remove(&anim.id);
+                    if let Some(a) = self.boot_anims.iter_mut().find(|a| a.id == anim.id) {
+                        *a = anim;
+                    }
+                    self.save_boot();
+                    self.preview_texture = None;
+                }
                 match target {
                     UploadTarget::Standby(id) => self.on_device.standby = Some(id),
                     UploadTarget::Boot(id) => self.on_device.boot = Some(id),
@@ -839,29 +855,6 @@ impl App {
             BgDone::VideoImported(Err(e)) | BgDone::StandbyImported(Err(e)) | BgDone::BootImported(Err(e)) => {
                 self.status_msg = format!("Import failed: {e}");
             }
-
-            BgDone::BootRotated(Ok(anim)) => {
-                self.status_msg = format!("Rotated to {}°", anim.rotation);
-                self.thumb_cache.remove(&anim.id);
-                // The rebuilt container is no longer what is on the device.
-                if self.on_device.boot.as_deref() == Some(&anim.id) {
-                    self.on_device.boot = None;
-                    let _ = shared::save_on_device(&self.data_dir, &self.on_device);
-                }
-                if let Some(a) = self.boot_anims.iter_mut().find(|a| a.id == anim.id) {
-                    *a = anim;
-                }
-                self.save_boot();
-                self.preview_texture = None;
-            }
-            BgDone::BootRotated(Err(e)) => self.status_msg = format!("Rotation failed: {e}"),
-
-            BgDone::PlayReady(Ok(cmd)) => {
-                if self.send(cmd) {
-                    self.status_msg = "Streaming".into();
-                }
-            }
-            BgDone::PlayReady(Err(e)) => self.status_msg = format!("Rotate failed: {e}"),
         }
     }
 
@@ -880,62 +873,90 @@ impl App {
         }
     }
 
-    fn rotate_video(&mut self, id: &str, delta: i32) {
-        let Some(v) = self.videos.iter_mut().find(|v| v.id == id) else { return };
-        v.rotation = (v.rotation + delta).rem_euclid(360);
-        let new_rot = v.rotation;
-        // Invalidate cached rotated frames so the next play regenerates them
-        if shared::is_valid_id(id) {
-            let _ = std::fs::remove_dir_all(rotated_frames_dir(&self.data_dir, id));
+    /// Change the global screen rotation (how the cooler is mounted). It applies
+    /// to everything sent to the LCD; a running stream is re-sent at once.
+    fn set_rotation(&mut self, delta: i32) {
+        self.settings.rotation = shared::normalize_rotation(self.settings.rotation + delta);
+        if let Err(e) = shared::save_settings(&self.data_dir, &self.settings) {
+            self.status_msg = format!("Error: {e}");
+            return;
         }
-        self.save_videos();
-        self.status_msg = format!("Rotation {new_rot}° (applied when sent to the LCD)");
+        self.status_msg =
+            format!("Screen rotation {}° (applies to animations, standby and boot)", self.settings.rotation);
+        let playing = self.daemon_status.playing_id.clone().filter(|_| self.daemon_status.streaming);
+        if let Some(v) = playing.and_then(|id| self.videos.iter().find(|v| v.id == id).cloned()) {
+            self.send(self.play_cmd(&v));
+        }
     }
 
-    fn rotate_boot(&mut self, id: &str, delta: i32) {
-        let Some(anim) = self.boot_anims.iter().find(|a| a.id == id).cloned() else { return };
-        let rotation = (anim.rotation + delta).rem_euclid(360);
-        self.spawn_bg(format!("Re-encoding at {rotation}°..."), move || {
-            let result = import::build_boot_from_gif(Path::new(&anim.source_gif), rotation, Path::new(&anim.path))
-                .map(|(frame_count, fps, thumbnail)| BootAnim { rotation, frame_count, fps, thumbnail, ..anim });
-            BgDone::BootRotated(result)
-        });
+    fn play_cmd(&self, v: &Video) -> Cmd {
+        Cmd::Play {
+            frames_dir: frames_dir(&self.data_dir, &v.id).display().to_string(),
+            fps: v.fps,
+            frame_count: v.frame_count,
+            id: v.id.clone(),
+            rotation: self.settings.rotation,
+        }
     }
 
     fn play_selected(&mut self) {
         let Some(id) = self.selected_video.clone() else { return };
         let Some(v) = self.videos.iter().find(|v| v.id == id).cloned() else { return };
-        let src = frames_dir(&self.data_dir, &v.id);
-        let dst = rotated_frames_dir(&self.data_dir, &v.id);
-        let (count, rotation) = (v.frame_count, v.rotation);
-        let play = move |dir: &Path| Cmd::Play {
-            frames_dir: dir.display().to_string(),
-            fps: v.fps,
-            frame_count: v.frame_count,
-            id: v.id.clone(),
-            rotation: v.rotation,
-        };
-        if rotation == 0 {
-            if self.send(play(&src)) {
-                self.status_msg = "Streaming".into();
-            }
-            return;
+        if self.send(self.play_cmd(&v)) {
+            self.status_msg = "Streaming".into();
         }
-        self.spawn_bg("Applying rotation...", move || {
-            BgDone::PlayReady(import::rotate_frames(&src, &dst, count, rotation).map(|()| play(&dst)))
-        });
     }
 
-    fn start_upload(&mut self, cmd: Cmd, what: &'static str, done_msg: &'static str, target: UploadTarget) {
+    /// Write to flash in the background. The image is first prepared at the
+    /// current screen rotation: a rotated copy of a standby image, or a boot
+    /// animation rebuilt from its GIF if it was built at another rotation.
+    fn start_upload(&mut self, what: &'static str, done_msg: &'static str, target: UploadTarget) {
+        let rotation = self.settings.rotation;
+        let data = self.data_dir.clone();
+        let standby = match &target {
+            UploadTarget::Standby(id) => self.standby.iter().find(|i| &i.id == id).cloned(),
+            UploadTarget::Boot(_) => None,
+        };
+        let boot = match &target {
+            UploadTarget::Boot(id) => self.boot_anims.iter().find(|a| &a.id == id).cloned(),
+            UploadTarget::Standby(_) => None,
+        };
         let label = format!("Writing {what} to device flash. Do not unplug or power off...");
         self.status_msg.clear();
         self.spawn_bg(label, move || {
-            let result = match daemon_cmd(&cmd) {
-                Ok(Resp::Ok) => Ok(()),
+            let prepare = || -> Result<(Cmd, Option<BootAnim>), String> {
+                if let Some(img) = standby {
+                    let path = if rotation == 0 {
+                        PathBuf::from(&img.path)
+                    } else {
+                        let rotated = shared::standby_dir(&data).join(format!("{}-rot{rotation}.jpg", img.id));
+                        import::import_standby(Path::new(&img.path), &rotated, rotation)?;
+                        rotated
+                    };
+                    return Ok((Cmd::UploadStandby { path: path.display().to_string() }, None));
+                }
+                let anim = boot.ok_or("item not found")?;
+                let rebuilt = if anim.rotation != rotation {
+                    if !Path::new(&anim.source_gif).exists() {
+                        return Err(format!(
+                            "this boot animation was built at {}° and its source GIF is gone; re-import it",
+                            anim.rotation
+                        ));
+                    }
+                    let (frame_count, fps, thumbnail) =
+                        import::build_boot_from_gif(Path::new(&anim.source_gif), rotation, Path::new(&anim.path))?;
+                    Some(BootAnim { rotation, frame_count, fps, thumbnail, ..anim.clone() })
+                } else {
+                    None
+                };
+                Ok((Cmd::UploadBoot { path: anim.path.clone() }, rebuilt))
+            };
+            let result = prepare().and_then(|(cmd, rebuilt)| match daemon_cmd(&cmd) {
+                Ok(Resp::Ok) => Ok(rebuilt),
                 Ok(Resp::Err { msg }) => Err(msg),
                 Ok(Resp::Status(_)) => Err("unexpected reply from daemon".into()),
                 Err(e) => Err(e),
-            };
+            });
             BgDone::Uploaded(result, done_msg, target)
         });
     }
@@ -959,6 +980,12 @@ impl App {
             Tab::Standby => {
                 if let Some(img) = self.standby.iter().find(|i| i.id == id) {
                     let _ = std::fs::remove_file(&img.path);
+                }
+                if shared::is_valid_id(id) {
+                    for r in [90, 180, 270] {
+                        let _ =
+                            std::fs::remove_file(shared::standby_dir(&self.data_dir).join(format!("{id}-rot{r}.jpg")));
+                    }
                 }
                 self.standby.retain(|i| i.id != id);
                 self.save_standby();
@@ -1012,7 +1039,6 @@ struct Hero {
     name: String,
     meta: String,
     badges: Vec<(&'static str, Color32)>,
-    rotation: Option<i32>,
     live: bool,
 }
 
@@ -1174,9 +1200,8 @@ impl App {
                 let live = self.daemon_status.streaming && self.daemon_status.playing_id.as_deref() == Some(&v.id);
                 Some(Hero {
                     name: v.name.clone(),
-                    meta: format!("{} frames · {:.0} fps · {}°", v.frame_count, v.fps, v.rotation),
+                    meta: format!("{} frames · {:.0} fps", v.frame_count, v.fps),
                     badges: if live { vec![("STREAMING", GREEN)] } else { vec![] },
-                    rotation: Some(v.rotation),
                     live,
                 })
             }
@@ -1188,7 +1213,6 @@ impl App {
                     name: img.name.clone(),
                     meta: format!("480×480 JPEG · {} KB", size.div_ceil(1024)),
                     badges: if on { vec![("ON LCD", GREEN)] } else { vec![] },
-                    rotation: None,
                     live: on,
                 })
             }
@@ -1197,9 +1221,8 @@ impl App {
                 let on = self.on_device.boot.as_deref() == Some(&a.id);
                 Some(Hero {
                     name: a.name.clone(),
-                    meta: format!("{} frames · {:.1} fps · {}°", a.frame_count, a.fps, a.rotation),
+                    meta: format!("{} frames · {:.1} fps", a.frame_count, a.fps),
                     badges: if on { vec![("ON LCD", GREEN)] } else { vec![] },
-                    rotation: Some(a.rotation),
                     live: on,
                 })
             }
@@ -1232,10 +1255,8 @@ impl App {
                     ui.add_space(16.0);
 
                     ui.horizontal(|ui| {
-                        if let Some(rot) = hero.rotation {
-                            self.ui_rotate(ui, rot);
-                            ui.add_space(10.0);
-                        }
+                        self.ui_rotate(ui);
+                        ui.add_space(10.0);
                         self.ui_primary_action(ui, hero.live);
                     });
                     ui.add_space(8.0);
@@ -1250,35 +1271,16 @@ impl App {
         });
     }
 
-    fn ui_rotate(&mut self, ui: &mut egui::Ui, rotation: i32) {
+    /// Global screen rotation: set once to match how the cooler is mounted.
+    fn ui_rotate(&mut self, ui: &mut egui::Ui) {
         let enabled = self.bg_task.is_none();
-        let hint = match self.tab {
-            Tab::Boot => "re-encodes the animation",
-            _ => "applied when sent to the LCD",
-        };
-        let mut delta = 0;
-        if icon_button(ui, enabled, "↺", &format!("Rotate left ({hint})")) {
-            delta = -90;
+        let hint = "Screen rotation: how the cooler is mounted. Applies to animations, standby and boot.";
+        if icon_button(ui, enabled, "↺", hint) {
+            self.set_rotation(-90);
         }
-        ui.label(mono(format!("{rotation:>3}°"), 10.5, TEXT_DIM));
-        if icon_button(ui, enabled, "↻", &format!("Rotate right ({hint})")) {
-            delta = 90;
-        }
-        if delta == 0 {
-            return;
-        }
-        match self.tab {
-            Tab::Animation => {
-                if let Some(id) = self.selected_video.clone() {
-                    self.rotate_video(&id, delta);
-                }
-            }
-            Tab::Boot => {
-                if let Some(id) = self.selected_boot.clone() {
-                    self.rotate_boot(&id, delta);
-                }
-            }
-            Tab::Standby => {}
+        ui.label(mono(format!("{:>3}°", self.settings.rotation), 10.5, TEXT_DIM)).on_hover_text(hint);
+        if icon_button(ui, enabled, "↻", hint) {
+            self.set_rotation(90);
         }
     }
 
@@ -1297,7 +1299,6 @@ impl App {
                 if primary_button(ui, self.can_write(), "WRITE TO LCD") {
                     if let Some(img) = self.standby.iter().find(|i| Some(&i.id) == self.selected_standby.as_ref()) {
                         self.confirm = Some(Confirm::Upload {
-                            cmd: Cmd::UploadStandby { path: img.path.clone() },
                             what: "standby image",
                             done_msg: "Standby image written.",
                             target: UploadTarget::Standby(img.id.clone()),
@@ -1309,7 +1310,6 @@ impl App {
                 if primary_button(ui, self.can_write(), "WRITE TO LCD") {
                     if let Some(a) = self.boot_anims.iter().find(|a| Some(&a.id) == self.selected_boot.as_ref()) {
                         self.confirm = Some(Confirm::Upload {
-                            cmd: Cmd::UploadBoot { path: a.path.clone() },
                             what: "boot animation",
                             done_msg: "Boot animation written. Power-cycle the cooler to see it.",
                             target: UploadTarget::Boot(a.id.clone()),
@@ -1529,7 +1529,7 @@ impl App {
 
         match decision {
             Some(true) => match self.confirm.take() {
-                Some(Confirm::Upload { cmd, what, done_msg, target }) => self.start_upload(cmd, what, done_msg, target),
+                Some(Confirm::Upload { what, done_msg, target }) => self.start_upload(what, done_msg, target),
                 Some(Confirm::Delete { tab, id, .. }) => self.delete_item(tab, &id),
                 None => {}
             },

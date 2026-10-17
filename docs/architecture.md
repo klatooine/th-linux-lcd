@@ -126,7 +126,7 @@ struct App {
 }
 ```
 
-Imports (file picker + Pillow), rotation re-encoding and uploads run on a background thread and post a `BgDone` result back via a `channel`; the UI thread never blocks on them. Uploads to flash require confirmation in a dialog.
+Imports (file picker + Pillow), preparing uploads at the current screen rotation, and the uploads themselves run on a background thread and post a `BgDone` result back via a `channel`; the UI thread never blocks on them. Uploads to flash require confirmation in a dialog.
 
 ---
 
@@ -160,7 +160,8 @@ autoplay.json    id of the video to resume when the daemon starts
 on_device.json   ids of the standby image / boot animation last written by the app (the device has no read-back command)
 overlay.json     stats overlay settings (owned by the daemon)
 frames/<id>/     f00001.jpg … fNNNNN.jpg  (extracted animation frames)
-frames/<id>-rotated/                      (cached rotated frames)
+settings.json    global settings (screen rotation)
+standby/<id>-rot<deg>.jpg                 (standby image rotated for the screen, made on upload)
 standby/<id>.jpg                          (converted standby images)
 boot/<id>.bootanim                        (Update_Boot_GIF container)
 ```

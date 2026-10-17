@@ -110,7 +110,7 @@ The boot upload uses the same chunked protocol as standby (kind=0) with two diff
 
 ## Rotation
 
-Rotation is re-encoded at import time. The source GIF path is stored in `boot.json` (`source_gif` field). When the user rotates, the container is rebuilt from the original GIF with the new angle applied during Pillow resizing:
+The global screen rotation (see [animation-streaming.md](animation-streaming.md#rotation)) is baked into the container. `boot.json` records the rotation each container was built at (`rotation`) and the source GIF (`source_gif`). When you write a boot animation and the global rotation has changed since it was built, the GUI first rebuilds the container from the source GIF with the new angle applied during Pillow resizing:
 
 ```python
 frame.rotate(-rotation, expand=False)

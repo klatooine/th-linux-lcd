@@ -1,9 +1,9 @@
 # th-linux-lcd
 
 A Linux app for the LCD screen on the **Thermaltake TH420V2 Ultra** AIO cooler (USB `264a:233c`).
-Stream GIFs to the screen, set the standby image, and set the boot animation, with no Windows required.
+Stream GIFs to the screen with live PC stats on top, set the standby image, and set the boot animation, with no Windows required.
 
-![TH Linux LCD](docs/screenshot.png)
+<p align="center"><img src="docs/lcd-saiyan.png" width="320" alt="A GIF streaming on the LCD with CPU, coolant and GPU temperatures and CPU, GPU and RAM load drawn on top"></p>
 
 > [!WARNING]
 > Unofficial and unsupported. Not affiliated with Thermaltake. The standby image and boot animation are
@@ -16,8 +16,9 @@ Stream GIFs to the screen, set the standby image, and set the boot animation, wi
 - **Animation**: stream a GIF to the screen live. It keeps playing while the app is closed and resumes after a reboot.
 - **Standby image**: the picture the screen shows when nothing is streaming.
 - **Boot animation**: the animation shown when the PC powers on.
-- **Screen on/off**, **rotation** in 90° steps, and a **tray icon** that shows the status and opens the app.
-- **Stats on the screen**: CPU, coolant and GPU temperature, plus CPU, GPU and RAM load, drawn on top of the streamed GIF. Each one can be switched on or off in the app. There are four styles (Terminal, Retro amber CRT, Heavy metal chrome, Kawaii bubble stickers), and you can adjust the size and position.
+- **Stats on the screen**: CPU, coolant and GPU temperature, plus CPU, GPU and RAM load, drawn on top of the streamed GIF. See [below](#stats-on-the-screen).
+- **Screen rotation**: set it once to match how your cooler is mounted, and it applies to everything you send.
+- **Screen on/off** and a **tray icon** that shows the status and opens the app.
 - **Plug and play**: unplug the cooler's USB and streaming pauses; plug it back in and it picks up again.
 
 ## Install
@@ -40,9 +41,22 @@ Open **TH Linux LCD** from your app menu, click the tray icon, or run `th-linux-
 
 - **Animation**: click **+ ADD GIF**, select it, then **SEND TO LCD**.
 - **Standby / Boot**: add an image or GIF, then **WRITE TO LCD**. Don't unplug or power off until the status bar says it's done (up to a minute). To see a new boot animation, power-cycle the cooler.
+- **Rotation**: if the picture comes out sideways, press **↺** or **↻** until it's upright. That's remembered for every animation, standby image and boot animation, including ones you add later.
 - Switch tabs with **Ctrl+1 / 2 / 3**.
 
 The cooler has no way to send back what's stored on it, so the app marks the items it last wrote with **ON LCD**.
+
+## Stats on the screen
+
+![The five overlay styles: Terminal, Retro, Metal, Kawaii, Saiyan](docs/lcd-styles.png)
+
+Turn it on in the **Stats on LCD** card on the Animation tab. You can:
+
+- pick a style: **Terminal**, **Retro** (amber CRT), **Metal** (chrome), **Kawaii** (bubble stickers) or **Saiyan** (anime title)
+- choose which stats to show: CPU, coolant and GPU temperature; CPU, GPU and RAM load
+- change the size and move it up or down. At larger sizes the stats rearrange into columns so they really get bigger.
+
+The stats update every 2 seconds and are drawn on streamed GIFs only. Coolant temperature comes from the pump itself, CPU and RAM from Linux, and GPU from the NVIDIA driver or AMD's sysfs.
 
 ## Troubleshooting
 
