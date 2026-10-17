@@ -39,6 +39,8 @@ On Arch you can also run `makepkg -si` instead, then `systemctl --user enable --
 
 Open **TH Linux LCD** from your app menu, click the tray icon, or run `th-linux-lcd`.
 
+![The TH Linux LCD app streaming an animation with the stats overlay](docs/app.png)
+
 - **Animation**: click **+ ADD GIF**, select it, then **SEND TO LCD**.
 - **Standby / Boot**: add an image or GIF, then **WRITE TO LCD**. Don't unplug or power off until the status bar says it's done (up to a minute). To see a new boot animation, power-cycle the cooler.
 - **Rotation**: if the picture comes out sideways, press **↺** or **↻** until it's upright. That's remembered for every animation, standby image and boot animation, including ones you add later.
