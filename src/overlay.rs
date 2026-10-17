@@ -540,8 +540,11 @@ fn ramp(stops: &[(f32, u32)], t: f32) -> [f32; 3] {
 }
 
 /// Pre-rendered overlay for a horizontal band of the frame (premultiplied RGBA).
+#[derive(Clone)]
 pub struct Layer {
+    x0: usize,
     y0: usize,
+    w: usize,
     h: usize,
     rgba: Vec<[u8; 4]>,
 }
@@ -745,7 +748,7 @@ impl Layer {
 
         let rgba =
             canvas.px.iter().map(|p| [0, 1, 2, 3].map(|c| (p[c].clamp(0.0, 1.0) * 255.0).round() as u8)).collect();
-        Some(Self { y0: canvas.y0, h: canvas.h, rgba })
+        Some(Self { x0: 0, y0: canvas.y0, w: SIZE, h: canvas.h, rgba })
     }
 
     /// Blend onto a 480×480 image buffer with `channels` bytes per pixel (3 = RGB, 4 = RGBA).
@@ -754,18 +757,42 @@ impl Layer {
             return;
         }
         for row in 0..self.h {
-            for x in 0..SIZE {
-                let [r, g, b, a] = self.rgba[row * SIZE + x];
+            for col in 0..self.w {
+                let [r, g, b, a] = self.rgba[row * self.w + col];
                 if a == 0 {
                     continue;
                 }
-                let p = ((self.y0 + row) * SIZE + x) * channels;
+                let p = ((self.y0 + row) * SIZE + self.x0 + col) * channels;
                 let inv = 255 - a as u32;
                 for (c, fg) in [r, g, b].into_iter().enumerate() {
                     buf[p + c] = (fg as u32 + buf[p + c] as u32 * inv / 255).min(255) as u8;
                 }
             }
         }
+    }
+
+    /// The layer rotated clockwise by `degrees` (multiples of 90) about the
+    /// screen centre, matching frames that were rotated the same way.
+    pub fn rotated_cw(self, degrees: i32) -> Layer {
+        let mut l = self;
+        for _ in 0..(degrees.rem_euclid(360) / 90) {
+            l = l.rot90_cw();
+        }
+        l
+    }
+
+    /// (x, y) → (SIZE-1-y, x).
+    fn rot90_cw(&self) -> Layer {
+        let (nx0, ny0, nw, nh) = (SIZE - self.y0 - self.h, self.x0, self.h, self.w);
+        let mut rgba = vec![[0u8; 4]; nw * nh];
+        for row in 0..self.h {
+            for col in 0..self.w {
+                let (sx, sy) = (self.x0 + col, self.y0 + row);
+                let (dx, dy) = (SIZE - 1 - sy, sx);
+                rgba[(dy - ny0) * nw + (dx - nx0)] = self.rgba[row * self.w + col];
+            }
+        }
+        Layer { x0: nx0, y0: ny0, w: nw, h: nh, rgba }
     }
 
     /// Decode a 480×480 JPEG frame, draw the overlay and re-encode it as a
@@ -876,13 +903,45 @@ mod tests {
                 for vertical in [0.0, OVERLAY_TOP, 0.5, 1.0] {
                     let s = OverlaySettings { style, size, vertical, ..all_on() };
                     let layer = Layer::render(&r, &s).expect("renders");
-                    assert!(layer.y0 + layer.h <= SIZE);
+                    assert!(layer.y0 + layer.h <= SIZE && layer.x0 + layer.w <= SIZE);
                     assert!(layer.rgba.iter().any(|p| p[3] > 0), "{style:?} draws something");
                     // Premultiplied: colour never exceeds alpha.
                     assert!(layer.rgba.iter().all(|p| p[0] <= p[3] && p[1] <= p[3] && p[2] <= p[3]));
                 }
             }
         }
+    }
+
+    #[test]
+    fn rotation_moves_the_overlay_with_the_frame() {
+        let layer = Layer::render(&rows(&metrics(), &all_on()), &all_on()).unwrap(); // at the bottom
+        let blend = |l: &Layer| {
+            let mut img = vec![0u8; SIZE * SIZE * 3];
+            l.apply(&mut img, 3);
+            img
+        };
+        // Centre of mass of the drawn pixels.
+        let centre = |img: &[u8]| {
+            let (mut sx, mut sy, mut n) = (0f64, 0f64, 0f64);
+            for (i, px) in img.chunks(3).enumerate() {
+                if px.iter().any(|&c| c > 0) {
+                    sx += (i % SIZE) as f64;
+                    sy += (i / SIZE) as f64;
+                    n += 1.0;
+                }
+            }
+            (sx / n, sy / n)
+        };
+        let (_, y) = centre(&blend(&layer));
+        assert!(y > 300.0, "starts at the bottom");
+        // Frames rotated clockwise by 90° put their bottom edge on the left.
+        let (x, _) = centre(&blend(&layer.clone().rotated_cw(90)));
+        assert!(x < 180.0, "rotated to the left, got x = {x}");
+        let (_, y) = centre(&blend(&layer.clone().rotated_cw(180)));
+        assert!(y < 180.0, "rotated to the top");
+        // A full turn is the identity.
+        assert_eq!(blend(&layer.clone().rotated_cw(360)), blend(&layer.clone().rotated_cw(90).rotated_cw(270)));
+        assert_eq!(blend(&layer.clone().rotated_cw(0)), blend(&layer));
     }
 
     #[test]

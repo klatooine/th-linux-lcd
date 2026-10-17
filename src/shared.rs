@@ -154,6 +154,10 @@ pub enum Cmd {
         fps: f32,
         frame_count: usize,
         id: String,
+        /// Clockwise rotation (0/90/180/270) already applied to the frames;
+        /// the stats overlay is rotated the same way.
+        #[serde(default)]
+        rotation: i32,
     },
     Stop,
     ScreenOn,

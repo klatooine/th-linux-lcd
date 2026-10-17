@@ -40,6 +40,7 @@ enum UsbCmd {
         frames: Vec<Vec<u8>>,
         fps: f32,
         id: String,
+        rotation: i32,
     },
     Stop,
     Screen(bool),
@@ -135,11 +136,21 @@ struct Stream {
     next: Instant,
     fps: f32,
     id: String,
+    /// Clockwise rotation applied to the frames (0/90/180/270).
+    rotation: i32,
 }
 
 impl Stream {
-    fn new(frames: Vec<Vec<u8>>, fps: f32, id: String) -> Self {
-        Self { frames, idx: 0, period: Duration::from_secs_f32(1.0 / fps), next: Instant::now(), fps, id }
+    fn new(frames: Vec<Vec<u8>>, fps: f32, id: String, rotation: i32) -> Self {
+        Self {
+            frames,
+            idx: 0,
+            period: Duration::from_secs_f32(1.0 / fps),
+            next: Instant::now(),
+            fps,
+            id,
+            rotation: rotation.rem_euclid(360),
+        }
     }
 }
 
@@ -290,8 +301,11 @@ impl UsbThread {
 
     /// Re-render the overlay layer if the text or settings changed.
     fn refresh_overlay(&mut self) {
+        // Frames of a rotated video are pre-rotated; rotate the stats the same way
+        // so they stay upright on the screen.
+        let rotation = self.stream.as_ref().map_or(0, |s| s.rotation);
         let key = if self.overlay.enabled {
-            overlay::key(&overlay::rows(&self.metrics, &self.overlay), &self.overlay)
+            format!("{}|rot{rotation}", overlay::key(&overlay::rows(&self.metrics, &self.overlay), &self.overlay))
         } else {
             String::new()
         };
@@ -299,7 +313,7 @@ impl UsbThread {
             return;
         }
         self.cache.layer = if self.overlay.enabled {
-            Layer::render(&overlay::rows(&self.metrics, &self.overlay), &self.overlay)
+            Layer::render(&overlay::rows(&self.metrics, &self.overlay), &self.overlay).map(|l| l.rotated_cw(rotation))
         } else {
             None
         };
@@ -361,8 +375,9 @@ impl UsbThread {
         let fps = shared::sanitize_fps(v.fps).unwrap_or(15.0);
         if !frames.is_empty() {
             eprintln!("[daemon] autoplay: {} ({} frames @ {fps} fps)", v.name, frames.len());
-            self.cache.reset_frames(frames.len());
-            self.stream = Some(Stream::new(frames, fps, v.id.clone()));
+            self.stream = Some(Stream::new(frames, fps, v.id.clone(), v.rotation));
+            self.refresh_overlay();
+            self.cache.reset_frames(self.stream.as_ref().map_or(0, |s| s.frames.len()));
         }
     }
 
@@ -393,13 +408,14 @@ impl UsbThread {
     fn handle(&mut self, cmd: UsbCmd, mut reply: Option<Reply>) {
         let data = shared::data_dir();
         let result = match cmd {
-            UsbCmd::Play { frames, fps, id } => {
-                eprintln!("[daemon] play: {} frames @ {fps} fps", frames.len());
+            UsbCmd::Play { frames, fps, id, rotation } => {
+                eprintln!("[daemon] play: {} frames @ {fps} fps, rotation {rotation}°", frames.len());
                 if let Err(e) = shared::save_autoplay(&data, Some(&id)) {
                     eprintln!("[daemon] autoplay not saved: {e}");
                 }
-                self.cache.reset_frames(frames.len());
-                self.stream = Some(Stream::new(frames, fps, id));
+                self.stream = Some(Stream::new(frames, fps, id, rotation));
+                self.refresh_overlay();
+                self.cache.reset_frames(self.stream.as_ref().map_or(0, |s| s.frames.len()));
                 Ok(())
             }
             UsbCmd::Stop => {
@@ -544,7 +560,7 @@ impl UsbThread {
 fn dispatch(cmd: Cmd, tx: &SyncSender<Job>, status: &Mutex<DaemonStatus>) -> Result<Resp, String> {
     let (job, timeout) = match cmd {
         Cmd::Status => return Ok(Resp::Status(status.lock().map(|s| s.clone()).unwrap_or_default())),
-        Cmd::Play { frames_dir, fps, frame_count, id } => {
+        Cmd::Play { frames_dir, fps, frame_count, id, rotation } => {
             if !shared::is_valid_id(&id) {
                 return Err("invalid id".into());
             }
@@ -556,7 +572,19 @@ fn dispatch(cmd: Cmd, tx: &SyncSender<Job>, status: &Mutex<DaemonStatus>) -> Res
             if frames.is_empty() {
                 return Err(format!("no frames found in {frames_dir}"));
             }
-            (UsbCmd::Play { frames, fps, id }, QUICK_REPLY_TIMEOUT)
+            // Older GUIs don't send the rotation: if these are the video's rotated
+            // frames, take the rotation from the library.
+            let rotation =
+                if rotation == 0 && Path::new(&frames_dir) == shared::rotated_frames_dir(&shared::data_dir(), &id) {
+                    shared::load_videos(&shared::data_dir()).0.iter().find(|v| v.id == id).map_or(0, |v| v.rotation)
+                } else {
+                    rotation
+                }
+                .rem_euclid(360);
+            if rotation % 90 != 0 {
+                return Err("rotation must be a multiple of 90".into());
+            }
+            (UsbCmd::Play { frames, fps, id, rotation }, QUICK_REPLY_TIMEOUT)
         }
         Cmd::Stop => (UsbCmd::Stop, QUICK_REPLY_TIMEOUT),
         Cmd::ScreenOn => (UsbCmd::Screen(true), QUICK_REPLY_TIMEOUT),

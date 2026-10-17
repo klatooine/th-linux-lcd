@@ -913,6 +913,7 @@ impl App {
             fps: v.fps,
             frame_count: v.frame_count,
             id: v.id.clone(),
+            rotation: v.rotation,
         };
         if rotation == 0 {
             if self.send(play(&src)) {
