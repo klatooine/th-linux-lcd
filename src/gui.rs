@@ -590,15 +590,8 @@ impl App {
             .status()
             .is_ok_and(|s| s.success());
         if !via_systemd {
-            let exe = match std::env::current_exe() {
-                Ok(e) => e,
-                Err(e) => {
-                    self.status_msg = format!("Failed to start daemon: {e}");
-                    return;
-                }
-            };
             // Own process group, so Ctrl-C in the GUI's terminal does not kill it.
-            match Command::new(exe).arg("--daemon").stdin(Stdio::null()).process_group(0).spawn() {
+            match Command::new(shared::app_exe()).arg("--daemon").stdin(Stdio::null()).process_group(0).spawn() {
                 Ok(child) => self.daemon_child = Some(child),
                 Err(e) => {
                     self.status_msg = format!("Failed to start daemon: {e}");

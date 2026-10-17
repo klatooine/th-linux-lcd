@@ -99,11 +99,7 @@ impl Tray {
     /// Launch the GUI. If one is already running, the new process asks it
     /// to come forward and exits immediately.
     fn open_gui(&mut self) {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => return eprintln!("[tray] cannot find own executable: {e}"),
-        };
-        match Command::new(exe).stdin(Stdio::null()).process_group(0).spawn() {
+        match Command::new(shared::app_exe()).stdin(Stdio::null()).process_group(0).spawn() {
             Ok(child) => self.gui_children.push(child),
             Err(e) => eprintln!("[tray] cannot start the GUI: {e}"),
         }

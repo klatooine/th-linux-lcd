@@ -64,6 +64,22 @@ pub fn runtime_dir() -> PathBuf {
     d
 }
 
+/// Path of this program's binary, for launching the GUI or daemon.
+///
+/// After an upgrade replaces the binary, a long-running process (e.g. the
+/// tray) sees `current_exe()` as "<path> (deleted)"; strip that so the new
+/// binary at the same path is used, and fall back to `th-linux-lcd` on PATH.
+pub fn app_exe() -> PathBuf {
+    if let Ok(p) = std::env::current_exe() {
+        let s = p.to_string_lossy();
+        let path = PathBuf::from(s.strip_suffix(" (deleted)").unwrap_or(&s));
+        if path.exists() {
+            return path;
+        }
+    }
+    PathBuf::from("th-linux-lcd")
+}
+
 pub fn socket_path() -> PathBuf {
     runtime_dir().join("th-lcd.sock")
 }
