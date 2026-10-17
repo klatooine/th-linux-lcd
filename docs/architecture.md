@@ -143,7 +143,7 @@ Imports (file picker + Pillow), rotation re-encoding and uploads run on a backgr
 | `src/shared.rs` | IPC types, data model, atomic persistence, boot container build/validate, unit tests |
 | `src/import.rs` | python3/Pillow import scripts (paths passed as argv) |
 | `src/metrics.rs` | Host sensors: CPU temp (hwmon), CPU load (`/proc/stat`), RAM (`/proc/meminfo`), GPU (NVML or amdgpu sysfs) |
-| `src/overlay.rs` | Stats overlay: four styles (Terminal outline, Retro seven-segment on a panel, Heavy-metal chrome, Kawaii sticker outline) drawn with coverage masks and the bundled Hack font; size and vertical position adjustable; blended onto frames and re-encoded as 4:4:4 JPEG |
+| `src/overlay.rs` | Stats overlay: aligned grid layout (inline, or label-over-value "dashboard" for Metal/Kawaii), four styles (Terminal, Retro amber CRT, Heavy-metal chrome, Kawaii bubble stickers) built from coverage masks, gradients, extrusion and outlines; fonts from `assets/fonts/` (OFL) and Hack; size and vertical position adjustable; blended onto frames and re-encoded as 4:4:4 JPEG |
 | `examples/test_boot.rs` | Standalone upload tool for debugging the boot animation protocol |
 
 ---

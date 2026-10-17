@@ -272,11 +272,11 @@ pub enum OverlayStyle {
     /// Green labels, white values, dark outline.
     #[default]
     Terminal,
-    /// Yellow seven-segment digits on a black panel.
+    /// Amber CRT terminal (VT323) on a dark screen with scanlines and glow.
     RetroClock,
-    /// Chrome gradient with a thin dark border.
+    /// Blue-steel chrome in a heavy-metal font, bevelled and extruded.
     HeavyMetal,
-    /// Bubble-gum pink and mint green with a sticker outline.
+    /// Puffy pink/blue bubble letters with gloss and a sticker outline.
     Kawaii,
 }
 

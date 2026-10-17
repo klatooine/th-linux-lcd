@@ -1,10 +1,13 @@
-//! Stats overlay drawn onto streamed frames: up to two rows of text on the
-//! round 480×480 LCD, in one of several styles.
+//! Stats overlay drawn onto streamed frames: up to two rows of stats on the
+//! round 480×480 LCD, laid out as an aligned grid, in one of several styles.
 //!
 //! Row 1: CPU temp · coolant temp · GPU temp. Row 2: CPU load · GPU load · RAM.
 //! Rendering happens once per change of the displayed text into a `Layer`
 //! (premultiplied RGBA for a horizontal band of the screen), which is then
 //! blended onto each frame.
+//!
+//! Fonts: Hack (bundled with egui) for Terminal; Sniglet, VT323 and Metal Mania
+//! (SIL OFL, see `assets/fonts/`) for Kawaii, Retro and Heavy metal.
 
 use crate::shared::{Metrics, OverlaySettings, OverlayStyle, Stat, LCD_SIZE, STREAM_FRAME_BUDGET};
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
@@ -15,12 +18,48 @@ const SIZE: usize = LCD_SIZE as usize;
 const BASE_PX: f32 = 27.0;
 /// Keep text this far inside the round edge.
 const EDGE_MARGIN: f32 = 22.0;
+/// The stats block stays at least this far from the top/bottom of the screen.
+const SAFE_TOP: f32 = 58.0;
 const QUALITY_START: u8 = 60;
 
-fn font() -> &'static FontRef<'static> {
-    static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
-    FONT.get_or_init(|| FontRef::try_from_slice(epaint_default_fonts::HACK_REGULAR).expect("bundled font is valid"))
+// ── Fonts ─────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FontKind {
+    Hack,
+    Sniglet,
+    Vt323,
+    MetalMania,
 }
+
+impl FontKind {
+    fn font(self) -> &'static FontRef<'static> {
+        fn load(cell: &'static OnceLock<FontRef<'static>>, bytes: &'static [u8]) -> &'static FontRef<'static> {
+            cell.get_or_init(|| FontRef::try_from_slice(bytes).expect("bundled font is valid"))
+        }
+        static HACK: OnceLock<FontRef<'static>> = OnceLock::new();
+        static SNIGLET: OnceLock<FontRef<'static>> = OnceLock::new();
+        static VT323: OnceLock<FontRef<'static>> = OnceLock::new();
+        static METAL: OnceLock<FontRef<'static>> = OnceLock::new();
+        match self {
+            FontKind::Hack => load(&HACK, epaint_default_fonts::HACK_REGULAR),
+            FontKind::Sniglet => load(&SNIGLET, include_bytes!("../assets/fonts/sniglet/Sniglet-ExtraBold.ttf")),
+            FontKind::Vt323 => load(&VT323, include_bytes!("../assets/fonts/vt323/VT323-Regular.ttf")),
+            FontKind::MetalMania => load(&METAL, include_bytes!("../assets/fonts/metalmania/MetalMania-Regular.ttf")),
+        }
+    }
+
+    /// The font that actually has `c` (falls back to Hack for missing glyphs).
+    fn for_char(self, c: char) -> FontKind {
+        if self.font().glyph_id(c).0 != 0 {
+            self
+        } else {
+            FontKind::Hack
+        }
+    }
+}
+
+// ── Rows ──────────────────────────────────────────────────────────────────────
 
 /// One stat on the overlay, e.g. label "CPU", value "52°".
 #[derive(Debug, Clone, PartialEq)]
@@ -58,13 +97,17 @@ pub fn key(rows: &[Vec<Item>], s: &OverlaySettings) -> String {
 #[derive(Clone)]
 struct Mask {
     h: usize,
-    y0: f32,
+    y0: usize,
     data: Vec<f32>,
 }
 
 impl Mask {
     fn new(y0: usize, h: usize) -> Self {
-        Self { h, y0: y0 as f32, data: vec![0.0; SIZE * h] }
+        Self { h, y0, data: vec![0.0; SIZE * h] }
+    }
+
+    fn empty_like(&self) -> Self {
+        Self::new(self.y0, self.h)
     }
 
     /// Max-combine coverage at screen coordinates.
@@ -79,8 +122,8 @@ impl Mask {
         }
     }
 
-    /// Coverage of any shape described by a signed-distance function (screen coords),
-    /// evaluated inside the given bounding box.
+    /// Coverage of a shape given by a signed-distance function (screen
+    /// coords), evaluated inside the bounding box.
     fn fill_sdf(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, sdf: impl Fn(f32, f32) -> f32) {
         for y in (y0.floor() as i64 - 1)..=(y1.ceil() as i64 + 1) {
             for x in (x0.floor() as i64 - 1)..=(x1.ceil() as i64 + 1) {
@@ -90,7 +133,7 @@ impl Mask {
         }
     }
 
-    fn max_with(&self, other: &Mask) -> Mask {
+    fn union(&self, other: &Mask) -> Mask {
         let mut m = self.clone();
         for (a, b) in m.data.iter_mut().zip(&other.data) {
             *a = a.max(*b);
@@ -98,7 +141,52 @@ impl Mask {
         m
     }
 
-    /// Grow by `radius` px with an anti-aliased disc (for outlines).
+    /// `self` where `other` is not (clamped difference).
+    fn minus(&self, other: &Mask) -> Mask {
+        let mut m = self.clone();
+        for (a, b) in m.data.iter_mut().zip(&other.data) {
+            *a = (*a - b).max(0.0);
+        }
+        m
+    }
+
+    /// `self` clipped to `other`.
+    fn within(&self, other: &Mask) -> Mask {
+        let mut m = self.clone();
+        for (a, b) in m.data.iter_mut().zip(&other.data) {
+            *a *= b;
+        }
+        m
+    }
+
+    /// Integer translation.
+    fn shifted(&self, dx: i64, dy: i64) -> Mask {
+        let mut out = self.empty_like();
+        for y in 0..self.h as i64 {
+            let sy = y - dy;
+            if sy < 0 || sy >= self.h as i64 {
+                continue;
+            }
+            for x in 0..SIZE as i64 {
+                let sx = x - dx;
+                if sx >= 0 && sx < SIZE as i64 {
+                    out.data[y as usize * SIZE + x as usize] = self.data[sy as usize * SIZE + sx as usize];
+                }
+            }
+        }
+        out
+    }
+
+    /// Solid 3-D extrusion towards (dx, dy) per step, `depth` steps deep.
+    fn extrude(&self, depth: i64, dx: f32, dy: f32) -> Mask {
+        let mut out = self.empty_like();
+        for t in 1..=depth.max(1) {
+            out = out.union(&self.shifted((t as f32 * dx).round() as i64, (t as f32 * dy).round() as i64));
+        }
+        out
+    }
+
+    /// Grow by `radius` px with an anti-aliased disc (outlines, glow).
     fn dilate(&self, radius: f32) -> Mask {
         let r = radius.ceil() as i64;
         let offsets: Vec<(i64, i64, f32)> = (-r..=r)
@@ -108,7 +196,7 @@ impl Mask {
                 (w > 0.0).then_some((dx, dy, w))
             })
             .collect();
-        let mut out = Mask { h: self.h, y0: self.y0, data: vec![0.0; self.data.len()] };
+        let mut out = self.empty_like();
         for y in 0..self.h as i64 {
             for x in 0..SIZE as i64 {
                 let src = self.data[y as usize * SIZE + x as usize];
@@ -141,214 +229,181 @@ fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -
     (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r
 }
 
-// ── Text and seven-segment drawing ────────────────────────────────────────────
+// ── Text ──────────────────────────────────────────────────────────────────────
 
-/// Draw `text` with the bundled font; `bold` lists extra horizontal offsets
-/// (faux bold). Returns the advance width.
-fn draw_text(mask: &mut Mask, text: &str, px: f32, x: f32, cy: f32, bold: &[f32]) -> f32 {
-    let f = font();
-    let scale = PxScale::from(px);
-    let sf = f.as_scaled(scale);
-    let baseline = cy + (sf.ascent() + sf.descent()) / 2.0;
-    let mut pen = x;
-    for c in text.chars() {
+/// Pixel bounds of a drawn glyph: (x0, y0, x1, y1).
+type GlyphBox = [f32; 4];
+
+/// Draw a placed piece of text in the style's font; `lk.bold` lists extra
+/// horizontal offsets (faux bold). Glyph bounds are appended to `boxes`.
+fn draw_text(mask: &mut Mask, lk: &Look, p: &Placed, boxes: &mut Vec<GlyphBox>) {
+    let scale = PxScale::from(p.px);
+    let base = lk.font.font().as_scaled(scale);
+    let baseline = p.cy + (base.ascent() + base.descent()) / 2.0;
+    let mut pen = p.x;
+    for c in p.text.chars() {
+        let f = lk.font.for_char(c).font();
         let id = f.glyph_id(c);
-        for &dx in bold {
+        for &dx in lk.bold {
             let glyph = id.with_scale_and_position(scale, point(pen + dx, baseline));
             if let Some(outlined) = f.outline_glyph(glyph) {
                 let b = outlined.px_bounds();
+                if dx == 0.0 {
+                    boxes.push([b.min.x, b.min.y, b.max.x, b.max.y]);
+                }
                 outlined.draw(|gx, gy, cov| mask.plot(b.min.x as i64 + gx as i64, b.min.y as i64 + gy as i64, cov));
             }
         }
-        pen += sf.h_advance(id);
-    }
-    pen - x
-}
-
-fn text_width(text: &str, px: f32) -> f32 {
-    let f = font();
-    let sf = f.as_scaled(PxScale::from(px));
-    text.chars().map(|c| sf.h_advance(f.glyph_id(c))).sum()
-}
-
-const SEG_SLANT: f32 = 0.08;
-
-/// Segments a..g lit for each digit.
-fn seg_digit(d: char) -> Option<[bool; 7]> {
-    let s = |a, b, c, d, e, f, g| [a, b, c, d, e, f, g];
-    Some(match d {
-        '0' => s(true, true, true, true, true, true, false),
-        '1' => s(false, true, true, false, false, false, false),
-        '2' => s(true, true, false, true, true, false, true),
-        '3' => s(true, true, true, true, false, false, true),
-        '4' => s(false, true, true, false, false, true, true),
-        '5' => s(true, false, true, true, false, true, true),
-        '6' => s(true, false, true, true, true, true, true),
-        '7' => s(true, true, true, false, false, false, false),
-        '8' => s(true, true, true, true, true, true, true),
-        '9' => s(true, true, true, true, false, true, true),
-        '-' => s(false, false, false, false, false, false, true),
-        _ => return None,
-    })
-}
-
-fn seg_advance(c: char, h: f32) -> f32 {
-    match c {
-        '.' => 0.24 * h,
-        '°' => 0.4 * h,
-        _ if seg_digit(c).is_some() => 0.66 * h,
-        _ => text_width(&c.to_string(), h * 0.9),
+        pen += f.as_scaled(scale).h_advance(id);
     }
 }
 
-/// Seven-segment rendering of a value like "52°" or "31.5°". Unlit segments
-/// go into `ghost`. Returns the advance width.
-fn draw_seg(lit: &mut Mask, ghost: &mut Mask, text: &str, h: f32, x: f32, cy: f32) -> f32 {
-    let w = 0.5 * h;
-    let t = 0.13 * h;
-    let gap = 0.035 * h;
-    let top = cy - h / 2.0;
-    let (mid, bot) = (cy, cy + h / 2.0);
-    let mut pen = x;
-    for c in text.chars() {
-        let x0 = pen + 0.06 * h;
-        if let Some(on) = seg_digit(c) {
-            let (l, r) = (x0 + t / 2.0, x0 + w - t / 2.0);
-            let segs = [
-                (l + gap, top + t / 2.0, r - gap, top + t / 2.0),
-                (r, top + t / 2.0 + gap, r, mid - gap),
-                (r, mid + gap, r, bot - t / 2.0 - gap),
-                (l + gap, bot - t / 2.0, r - gap, bot - t / 2.0),
-                (l, mid + gap, l, bot - t / 2.0 - gap),
-                (l, top + t / 2.0 + gap, l, mid - gap),
-                (l + gap, mid, r - gap, mid),
-            ];
-            for (lit_on, &(ax, ay, bx, by)) in on.iter().zip(&segs) {
-                let target = if *lit_on { &mut *lit } else { &mut *ghost };
-                let slant = h * SEG_SLANT;
-                target.fill_sdf(ax.min(bx) - t, ay.min(by) - t, ax.max(bx) + t + slant, ay.max(by) + t, |px, py| {
-                    // Lean the digit to the right like a classic clock display.
-                    let ux = px - (mid - py) / h * slant;
-                    sd_capsule(ux, py, ax, ay, bx, by, t / 2.0)
-                });
-            }
-        } else if c == '.' {
-            let (dx, dy) = (x0 + 0.04 * h, bot - t / 2.0);
-            lit.fill_sdf(dx - t, dy - t, dx + t, dy + t, |px, py| {
-                ((px - dx).powi(2) + (py - dy).powi(2)).sqrt() - t * 0.6
-            });
-        } else if c == '°' {
-            let (dx, dy, rad) = (x0 + 0.16 * h, top + 0.17 * h, 0.11 * h);
-            lit.fill_sdf(dx - rad - t, dy - rad - t, dx + rad + t, dy + rad + t, |px, py| {
-                (((px - dx).powi(2) + (py - dy).powi(2)).sqrt() - rad).abs() - t * 0.38
-            });
-        } else {
-            draw_text(lit, &c.to_string(), h * 0.9, pen, cy, &[0.0, 1.0]);
-        }
-        pen += seg_advance(c, h);
-    }
-    pen - x
+fn text_width(fk: FontKind, text: &str, px: f32) -> f32 {
+    text.chars()
+        .map(|c| {
+            let f = fk.for_char(c).font();
+            f.as_scaled(PxScale::from(px)).h_advance(f.glyph_id(c))
+        })
+        .sum()
 }
 
-// ── Layout ────────────────────────────────────────────────────────────────────
+// ── Styles ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
-enum Part {
-    Label,
-    Value,
-}
-
-enum Piece {
-    Text { s: String, px: f32, part: Part },
-    Seg { s: String, h: f32 },
-    Gap(f32),
-}
-
-impl Piece {
-    fn width(&self) -> f32 {
-        match self {
-            Piece::Text { s, px, .. } => text_width(s, *px),
-            Piece::Seg { s, h } => s.chars().map(|c| seg_advance(c, *h)).sum(),
-            Piece::Gap(w) => *w,
-        }
-    }
-
-    fn scaled(self, k: f32) -> Piece {
-        match self {
-            Piece::Text { s, px, part } => Piece::Text { s, px: px * k, part },
-            Piece::Seg { s, h } => Piece::Seg { s, h: h * k },
-            Piece::Gap(w) => Piece::Gap(w * k),
-        }
-    }
-}
-
-/// Visual parameters per style.
+/// Font and spacing per style (sizes relative to the base text height).
 struct Look {
-    label_scale: f32,
-    seg_values: bool,
+    font: FontKind,
+    value_px: f32,
+    label_px: f32,
     bold: &'static [f32],
     row_gap: f32,
-    item_gap: f32,
+    col_gap: f32,
+    /// Retro terminal: "> " prompt before each row and a block cursor at the end.
+    terminal: bool,
+    /// Dashboard layout: small label centred above a big value in each column.
+    stacked: bool,
 }
 
 fn look(style: OverlayStyle) -> Look {
+    let l = |font, value_px, label_px, bold, row_gap, col_gap, terminal, stacked| Look {
+        font,
+        value_px,
+        label_px,
+        bold,
+        row_gap,
+        col_gap,
+        terminal,
+        stacked,
+    };
     match style {
-        OverlayStyle::Terminal => {
-            Look { label_scale: 1.0, seg_values: false, bold: &[0.0, 1.0], row_gap: 1.55, item_gap: 0.75 }
-        }
-        OverlayStyle::RetroClock => {
-            Look { label_scale: 0.55, seg_values: true, bold: &[0.0, 1.0], row_gap: 1.75, item_gap: 0.8 }
-        }
-        OverlayStyle::HeavyMetal => {
-            Look { label_scale: 1.0, seg_values: false, bold: &[0.0, 0.8, 1.6], row_gap: 1.6, item_gap: 0.75 }
-        }
-        OverlayStyle::Kawaii => {
-            Look { label_scale: 1.0, seg_values: false, bold: &[0.0, 0.8, 1.6], row_gap: 1.8, item_gap: 0.9 }
-        }
+        OverlayStyle::Terminal => l(FontKind::Hack, 1.0, 1.0, &[0.0, 1.0], 1.55, 0.75, false, false),
+        OverlayStyle::RetroClock => l(FontKind::Vt323, 1.3, 1.3, &[0.0, 0.5], 1.25, 0.9, true, false),
+        OverlayStyle::HeavyMetal => l(FontKind::MetalMania, 1.75, 1.0, &[0.0, 0.6], 0.12, 0.8, false, true),
+        OverlayStyle::Kawaii => l(FontKind::Sniglet, 1.6, 0.9, &[0.0], 0.2, 0.75, false, true),
     }
 }
 
-struct RowLayout {
-    cy: f32,
+/// Where each piece of text goes, after grid alignment and fitting to the circle.
+struct Placed {
+    text: String,
+    label: bool,
     x: f32,
-    width: f32,
-    height: f32,
-    pieces: Vec<Piece>,
+    cy: f32,
+    px: f32,
 }
 
-fn layout_rows(rows: &[Vec<Item>], s: &OverlaySettings) -> Vec<RowLayout> {
-    let lk = look(s.style);
-    let base = BASE_PX * s.size;
-    let vy = s.vertical * SIZE as f32;
-    let gap = base * lk.row_gap;
-    let centers: Vec<f32> = if rows.len() == 1 { vec![vy] } else { vec![vy - gap / 2.0, vy + gap / 2.0] };
-    let r = SIZE as f32 / 2.0;
+/// One grid row; `cy`/`height` describe its value line (used for gradients).
+struct RowLayout {
+    cy: f32,
+    height: f32,
+    x0: f32,
+    x1: f32,
+    pieces: Vec<Placed>,
+}
 
-    rows.iter()
-        .zip(centers)
-        .map(|(items, cy)| {
-            let mut pieces = Vec::new();
-            for (i, item) in items.iter().enumerate() {
-                if i > 0 {
-                    pieces.push(Piece::Gap(base * lk.item_gap));
-                }
-                let label_px = base * lk.label_scale;
-                pieces.push(Piece::Text { s: item.label.to_string(), px: label_px, part: Part::Label });
-                pieces.push(Piece::Gap(text_width(" ", label_px) * if lk.seg_values { 0.6 } else { 1.0 }));
-                pieces.push(if lk.seg_values {
-                    Piece::Seg { s: item.value.clone(), h: base }
-                } else {
-                    Piece::Text { s: item.value.clone(), px: base, part: Part::Value }
-                });
-            }
-            // Shrink to fit the circle's chord at this height.
-            let dy = (cy - r).abs() + base / 2.0;
+/// Lay out the stats as a grid: cells in the same column line up across rows.
+fn layout(rows: &[Vec<Item>], s: &OverlaySettings, lk: &Look) -> Vec<RowLayout> {
+    let base = BASE_PX * s.size;
+    let (vpx, lpx) = (base * lk.value_px, base * lk.label_px);
+    let w = |t: &str, px: f32| text_width(lk.font, t, px);
+    let space = w(" ", lpx);
+    let prompt = if lk.terminal { w("> ", lpx) } else { 0.0 };
+    let cursor = if lk.terminal { space * 1.4 } else { 0.0 };
+    let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let cell_w = |it: &Item| {
+        if lk.stacked {
+            w(it.label, lpx).max(w(&it.value, vpx))
+        } else {
+            w(it.label, lpx) + space + w(&it.value, vpx)
+        }
+    };
+    let col_w: Vec<f32> =
+        (0..cols).map(|c| rows.iter().filter_map(|r| r.get(c)).map(cell_w).fold(0.0, f32::max)).collect();
+    let gap = base * lk.col_gap;
+    let total = prompt + col_w.iter().sum::<f32>() + gap * cols.saturating_sub(1) as f32 + cursor;
+
+    // Vertical: each grid row is one line (inline) or label line + value line (stacked).
+    let label_drop = if lk.stacked { lpx * 0.55 + vpx * 0.5 } else { 0.0 };
+    let row_h = if lk.stacked { lpx + vpx } else { vpx };
+    let pitch = if lk.stacked { row_h + vpx * lk.row_gap } else { vpx * lk.row_gap };
+    let block_h = pitch * (rows.len() as f32 - 1.0) + row_h;
+    // Keep the block away from the round edge, where the circle gets too narrow.
+    let (min_c, max_c) = (SAFE_TOP + block_h / 2.0, SIZE as f32 - SAFE_TOP - block_h / 2.0);
+    let vy = (s.vertical * SIZE as f32).clamp(min_c.min(max_c), max_c.max(min_c));
+    let first = vy - pitch * (rows.len() as f32 - 1.0) / 2.0;
+    // Value-line centres (stacked: the value sits below its label).
+    let centers: Vec<f32> = (0..rows.len()).map(|i| first + i as f32 * pitch + label_drop / 2.0).collect();
+
+    // One scale for the whole grid so columns stay aligned: the tightest row decides.
+    let r = SIZE as f32 / 2.0;
+    let k = centers
+        .iter()
+        .map(|&cy| {
+            let dy = (cy - r).abs() + vpx / 2.0;
             let chord = 2.0 * (r * r - dy * dy).max(0.0).sqrt() - 2.0 * EDGE_MARGIN;
-            let w: f32 = pieces.iter().map(Piece::width).sum();
-            let k = if w > chord && chord > 0.0 { chord / w } else { 1.0 };
-            let pieces: Vec<Piece> = pieces.into_iter().map(|p| p.scaled(k)).collect();
-            let width = pieces.iter().map(Piece::width).sum::<f32>();
-            RowLayout { cy, x: r - width / 2.0, width, height: base * k, pieces }
+            if total > chord && chord > 0.0 {
+                chord / total
+            } else {
+                1.0
+            }
+        })
+        .fold(1.0, f32::min);
+
+    let x_start = r - total * k / 2.0;
+    rows.iter()
+        .zip(&centers)
+        .map(|(items, &cy)| {
+            let mut pieces = Vec::new();
+            let mut x = x_start;
+            if lk.terminal {
+                pieces.push(Placed { text: ">".into(), label: true, x, cy, px: lpx * k });
+                x += prompt * k;
+            }
+            for (c, it) in items.iter().enumerate() {
+                let cell_x = x + (col_w[..c].iter().sum::<f32>() + gap * c as f32) * k;
+                if lk.stacked {
+                    let centre = |t: &str, px: f32| cell_x + (col_w[c] - w(t, px)) * k / 2.0;
+                    let label_cy = cy - label_drop * k;
+                    pieces.push(Placed {
+                        text: it.label.into(),
+                        label: true,
+                        x: centre(it.label, lpx),
+                        cy: label_cy,
+                        px: lpx * k,
+                    });
+                    pieces.push(Placed {
+                        text: it.value.clone(),
+                        label: false,
+                        x: centre(&it.value, vpx),
+                        cy,
+                        px: vpx * k,
+                    });
+                } else {
+                    pieces.push(Placed { text: it.label.into(), label: true, x: cell_x, cy, px: lpx * k });
+                    let vx = cell_x + (w(it.label, lpx) + space) * k;
+                    pieces.push(Placed { text: it.value.clone(), label: false, x: vx, cy, px: vpx * k });
+                }
+            }
+            RowLayout { cy, height: vpx * k, x0: x_start, x1: x_start + total * k, pieces }
         })
         .collect()
 }
@@ -381,21 +436,21 @@ impl Canvas {
     }
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> [f32; 3] {
-    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+fn hex(c: u32) -> [f32; 3] {
+    [((c >> 16) & 0xff) as f32 / 255.0, ((c >> 8) & 0xff) as f32 / 255.0, (c & 0xff) as f32 / 255.0]
 }
 
 /// Piecewise-linear colour ramp; `stops` sorted by position in 0..1.
-fn ramp(stops: &[(f32, [f32; 3])], t: f32) -> [f32; 3] {
+fn ramp(stops: &[(f32, u32)], t: f32) -> [f32; 3] {
     let t = t.clamp(0.0, 1.0);
     for w in stops.windows(2) {
-        let ((t0, c0), (t1, c1)) = (w[0], w[1]);
+        let ((t0, c0), (t1, c1)) = ((w[0].0, hex(w[0].1)), (w[1].0, hex(w[1].1)));
         if t <= t1 {
             let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
             return [c0[0] + (c1[0] - c0[0]) * f, c0[1] + (c1[1] - c0[1]) * f, c0[2] + (c1[2] - c0[2]) * f];
         }
     }
-    stops.last().map_or([1.0; 3], |s| s.1)
+    stops.last().map_or([1.0; 3], |s| hex(s.1))
 }
 
 /// Pre-rendered overlay for a horizontal band of the frame (premultiplied RGBA).
@@ -414,83 +469,146 @@ impl Layer {
             return None;
         }
         let lk = look(s.style);
-        let laid = layout_rows(rows, &s);
-        let base = BASE_PX * s.size;
+        let laid = layout(rows, &s, &lk);
+        let k = s.size;
 
-        let pad = base * 0.9 + 14.0 * s.size;
-        let top = laid.iter().map(|r| r.cy - r.height / 2.0).fold(f32::MAX, f32::min) - pad;
-        let bottom = laid.iter().map(|r| r.cy + r.height / 2.0).fold(f32::MIN, f32::max) + pad;
+        let pad = BASE_PX * k * 1.2 + 16.0 * k;
+        let pieces = laid.iter().flat_map(|r| &r.pieces);
+        let top = pieces.clone().map(|p| p.cy - p.px / 2.0).fold(f32::MAX, f32::min) - pad;
+        let bottom = pieces.map(|p| p.cy + p.px / 2.0).fold(f32::MIN, f32::max) + pad;
         let y0 = top.max(0.0) as usize;
         let h = (bottom.min(SIZE as f32) as usize).saturating_sub(y0).max(1);
 
-        let mut label = Mask::new(y0, h);
-        let mut value = Mask::new(y0, h);
-        let mut ghost = Mask::new(y0, h);
+        let mut labels = Mask::new(y0, h);
+        let mut values = Mask::new(y0, h);
+        let mut boxes: Vec<GlyphBox> = Vec::new();
         for row in &laid {
-            let mut x = row.x;
-            for piece in &row.pieces {
-                match piece {
-                    Piece::Text { s: t, px, part } => {
-                        let m = if *part == Part::Label { &mut label } else { &mut value };
-                        x += draw_text(m, t, *px, x, row.cy, lk.bold);
-                    }
-                    Piece::Seg { s: t, h: sh } => x += draw_seg(&mut value, &mut ghost, t, *sh, x, row.cy),
-                    Piece::Gap(w) => x += w,
-                }
+            for p in &row.pieces {
+                let m = if p.label { &mut labels } else { &mut values };
+                draw_text(m, &lk, p, &mut boxes);
             }
         }
+        let text = labels.union(&values);
 
         let mut canvas = Canvas { y0, h, px: vec![[0.0; 4]; SIZE * h] };
-        let both = label.max_with(&value);
-        let k = s.size;
-        // Row-relative vertical position (0 = top of text, 1 = bottom) for gradients.
+        // Row index and row-relative position (0 = top of text, 1 = bottom) for gradients.
+        let nearest_row = |y: usize| -> usize {
+            (0..laid.len())
+                .min_by(|&a, &b| (laid[a].cy - y as f32).abs().total_cmp(&(laid[b].cy - y as f32).abs()))
+                .unwrap_or(0)
+        };
         let row_t = |y: usize| -> f32 {
-            let row = laid.iter().min_by(|a, b| (a.cy - y as f32).abs().total_cmp(&(b.cy - y as f32).abs()));
-            row.map_or(0.5, |r| (y as f32 - (r.cy - r.height / 2.0)) / r.height.max(1.0))
+            let r = &laid[nearest_row(y)];
+            (y as f32 - (r.cy - r.height * 0.42)) / (r.height * 0.84).max(1.0)
         };
 
         match s.style {
             OverlayStyle::Terminal => {
-                canvas.over(&both.dilate(3.0 * k), 0.9, |_, _| [0.0; 3]);
-                canvas.over(&label, 1.0, |_, _| rgb(0, 210, 55));
-                canvas.over(&value, 1.0, |_, _| rgb(255, 255, 255));
+                canvas.over(&text.dilate(3.0 * k), 0.9, |_, _| [0.0; 3]);
+                canvas.over(&labels, 1.0, |_, _| hex(0x00d237));
+                canvas.over(&values, 1.0, |_, _| hex(0xffffff));
             }
+
             OverlayStyle::RetroClock => {
-                // Black panel with a dark-yellow rim behind the whole block.
-                let x0 = laid.iter().map(|r| r.x).fold(f32::MAX, f32::min) - 14.0 * k;
-                let x1 = laid.iter().map(|r| r.x + r.width).fold(f32::MIN, f32::max) + 14.0 * k;
-                let py0 = laid.iter().map(|r| r.cy - r.height / 2.0).fold(f32::MAX, f32::min) - 10.0 * k;
-                let py1 = laid.iter().map(|r| r.cy + r.height / 2.0).fold(f32::MIN, f32::max) + 10.0 * k;
+                // Amber CRT: dark rounded screen with vignette, scanlines and phosphor glow.
+                let (x0, x1) = (laid[0].x0 - 16.0 * k, laid[0].x1 + 14.0 * k);
+                let py0 = laid.iter().map(|r| r.cy - r.height / 2.0).fold(f32::MAX, f32::min) - 9.0 * k;
+                let py1 = laid.iter().map(|r| r.cy + r.height / 2.0).fold(f32::MIN, f32::max) + 9.0 * k;
                 let (cx, cy, hw, hh, rad) =
-                    ((x0 + x1) / 2.0, (py0 + py1) / 2.0, (x1 - x0) / 2.0, (py1 - py0) / 2.0, 9.0 * k);
-                let mut panel = Mask::new(y0, h);
-                panel.fill_sdf(x0, py0, x1, py1, |px, py| sd_round_rect(px, py, cx, cy, hw, hh, rad));
-                let mut rim = Mask::new(y0, h);
-                rim.fill_sdf(x0, py0, x1, py1, |px, py| (sd_round_rect(px, py, cx, cy, hw, hh, rad) + 1.0).abs() - 1.0);
-                canvas.over(&panel, 0.9, |_, _| rgb(6, 5, 0));
-                canvas.over(&rim, 1.0, |_, _| rgb(110, 88, 0));
-                canvas.over(&ghost, 0.12, |_, _| rgb(255, 210, 0));
-                canvas.over(&value.dilate(2.5 * k), 0.22, |_, _| rgb(255, 190, 0)); // LED glow
-                canvas.over(&label, 1.0, |_, _| rgb(205, 165, 0));
-                canvas.over(&value, 1.0, |_, _| rgb(255, 214, 10));
+                    ((x0 + x1) / 2.0, (py0 + py1) / 2.0, (x1 - x0) / 2.0, (py1 - py0) / 2.0, 12.0 * k);
+                let mut screen = Mask::new(y0, h);
+                screen.fill_sdf(x0, py0, x1, py1, |px, py| sd_round_rect(px, py, cx, cy, hw, hh, rad));
+                let mut bezel = Mask::new(y0, h);
+                bezel.fill_sdf(x0 - 4.0, py0 - 4.0, x1 + 4.0, py1 + 4.0, |px, py| {
+                    (sd_round_rect(px, py, cx, cy, hw, hh, rad) - 1.0).abs() - 1.6 * k
+                });
+                canvas.over(&screen, 0.94, |x, y| {
+                    let d = (((x as f32 - cx) / hw).powi(2) + ((y as f32 - cy) / hh).powi(2)).sqrt();
+                    ramp(&[(0.0, 0x241706), (0.7, 0x150d03), (1.0, 0x070401)], d)
+                });
+                canvas.over(&bezel, 1.0, |_, _| hex(0x4a3414));
+
+                // Block cursor after the last value.
+                let last = laid.last().unwrap();
+                let end = last.pieces.last().map_or(last.x0, |p| p.x + text_width(lk.font, &p.text, p.px));
+                let (cw, ch) = (last.height * 0.42, last.height * 0.62);
+                let (ccx, ccy) = (end + last.height * 0.3 + cw / 2.0, last.cy + last.height * 0.04);
+                let mut cursor = Mask::new(y0, h);
+                cursor.fill_sdf(ccx - cw, ccy - ch, ccx + cw, ccy + ch, |px, py| {
+                    sd_round_rect(px, py, ccx, ccy, cw / 2.0, ch / 2.0, 1.0)
+                });
+
+                let glyphs = text.union(&cursor);
+                canvas.over(&glyphs.dilate(5.0 * k), 0.12, |_, _| hex(0xff8c00));
+                canvas.over(&glyphs.dilate(2.0 * k), 0.28, |_, _| hex(0xff9d00));
+                canvas.over(&labels, 1.0, |_, _| hex(0xd38b12));
+                canvas.over(&values, 1.0, |_, _| hex(0xffc23a));
+                canvas.over(&cursor, 1.0, |_, _| hex(0xffb31a));
+
+                // Scanlines across the screen, text included.
+                let mut lines = screen.clone();
+                for (i, v) in lines.data.iter_mut().enumerate() {
+                    if !(y0 + i / SIZE).is_multiple_of(3) {
+                        *v = 0.0;
+                    }
+                }
+                canvas.over(&lines, 0.35, |_, _| hex(0x000000));
             }
+
             OverlayStyle::HeavyMetal => {
+                // Polished blue steel: drop shadow, extruded side face, chrome face, bevel.
+                let depth = (4.0 * k).round() as i64;
+                let side = text.extrude(depth, 0.55, 1.0).minus(&text);
+                let solid = text.union(&side);
+                let mut shadow = solid.shifted((2.0 * k) as i64, (4.0 * k) as i64).dilate(2.5 * k);
+                shadow = shadow.minus(&solid);
+                canvas.over(&shadow, 0.55, |_, _| hex(0x000000));
+                canvas.over(&solid.dilate(1.2 * k), 0.9, |_, _| hex(0x0b0f16)); // thin border
+                canvas.over(&side, 1.0, |_, y| ramp(&[(0.0, 0x3c4a5c), (1.0, 0x151b24)], row_t(y)));
                 let chrome = [
-                    (0.0, rgb(250, 251, 255)),
-                    (0.42, rgb(160, 166, 178)),
-                    (0.5, rgb(52, 55, 64)),
-                    (0.58, rgb(120, 126, 138)),
-                    (1.0, rgb(235, 238, 246)),
+                    (0.0, 0xffffff),
+                    (0.28, 0xe3edf8),
+                    (0.47, 0x9fb4ca),
+                    (0.5, 0x2a3644),
+                    (0.62, 0x4f6680),
+                    (0.85, 0x9eb5cc),
+                    (1.0, 0xdbe6f2),
                 ];
-                canvas.over(&both.dilate(1.6 * k), 0.95, |_, _| rgb(14, 14, 18));
-                canvas.over(&both, 1.0, |_, y| ramp(&chrome, row_t(y)));
+                canvas.over(&text, 1.0, |_, y| ramp(&chrome, row_t(y)));
+                // Bevel: light on top-left edges, dark on bottom-right edges.
+                canvas.over(&text.minus(&text.shifted(1, 1)), 0.75, |_, _| hex(0xffffff));
+                canvas.over(&text.minus(&text.shifted(-1, -1)), 0.6, |_, _| hex(0x10161f));
             }
+
             OverlayStyle::Kawaii => {
-                let pink = [(0.0, rgb(255, 170, 215)), (0.55, rgb(255, 95, 175)), (1.0, rgb(240, 60, 150))];
-                canvas.over(&both.dilate(6.0 * k), 1.0, |_, _| rgb(90, 215, 160));
-                canvas.over(&both.dilate(3.2 * k), 1.0, |_, _| rgb(255, 255, 255));
-                canvas.over(&label, 1.0, |_, _| rgb(30, 165, 110));
-                canvas.over(&value, 1.0, |_, y| ramp(&pink, row_t(y)));
+                // Bubble letters: row 1 bubble-gum pink, row 2 baby blue; 3-D shade,
+                // gloss highlights, white sticker outline and a soft pink outer edge.
+                let depth = (3.0 * k).round() as i64;
+                let shade = text.extrude(depth, 0.6, 1.0).minus(&text);
+                let solid = text.union(&shade);
+                canvas.over(&solid.dilate(6.0 * k), 0.95, |_, _| hex(0xffc4e5));
+                canvas.over(&solid.dilate(3.5 * k), 1.0, |_, _| hex(0xffffff));
+                let pink = [(0.0, 0xffa8dc), (0.45, 0xff7cc8), (1.0, 0xff4fb0)];
+                let blue = [(0.0, 0xa8e2ff), (0.45, 0x74c6f6), (1.0, 0x4aa2e8)];
+                let row_of = |y: usize| nearest_row(y);
+                canvas.over(&shade, 1.0, |_, y| if row_of(y) == 0 { hex(0xc8338a) } else { hex(0x2f6fc4) });
+                canvas.over(&text, 1.0, |_, y| ramp(if row_of(y) == 0 { &pink } else { &blue }, row_t(y)));
+                // Glossy highlight on each glyph, kept inside the letter.
+                let mut gloss = Mask::new(y0, h);
+                for &[gx0, gy0, gx1, gy1] in &boxes {
+                    let (w, gh) = (gx1 - gx0, gy1 - gy0);
+                    if w < 4.0 || gh < 6.0 {
+                        continue;
+                    }
+                    let (ax, ay, bx, by, r) =
+                        (gx0 + 0.3 * w, gy0 + 0.2 * gh, gx0 + 0.55 * w, gy0 + 0.15 * gh, 0.06 * gh);
+                    gloss.fill_sdf(ax - r, by - r, bx + r, ay + r, |px, py| sd_capsule(px, py, ax, ay, bx, by, r));
+                    let (dx, dy, dr) = (gx0 + 0.2 * w, gy0 + 0.33 * gh, 0.045 * gh);
+                    gloss.fill_sdf(dx - dr, dy - dr, dx + dr, dy + dr, |px, py| {
+                        ((px - dx).powi(2) + (py - dy).powi(2)).sqrt() - dr
+                    });
+                }
+                canvas.over(&gloss.within(&text), 0.85, |_, _| hex(0xffffff));
             }
         }
 
@@ -586,6 +704,17 @@ mod tests {
     }
 
     #[test]
+    fn bundled_fonts_load_and_cover_stats() {
+        for fk in [FontKind::Hack, FontKind::Sniglet, FontKind::Vt323, FontKind::MetalMania] {
+            for c in "0123456789.%CPULIQGRAM> ".chars() {
+                assert_ne!(fk.font().glyph_id(c).0, 0, "{fk:?} lacks {c:?}");
+            }
+            // '°' may come from the Hack fallback, but must resolve somewhere.
+            assert_ne!(fk.for_char('°').font().glyph_id('°').0, 0);
+        }
+    }
+
+    #[test]
     fn rows_follow_layout_and_settings() {
         let r = rows(&metrics(), &all_on());
         let text: Vec<Vec<String>> =
@@ -598,6 +727,14 @@ mod tests {
         let none = Metrics::default();
         assert!(rows(&none, &all_on()).is_empty());
         assert!(Layer::render(&rows(&none, &all_on()), &all_on()).is_none());
+    }
+
+    #[test]
+    fn columns_line_up_across_rows() {
+        let s = all_on();
+        let laid = layout(&rows(&metrics(), &s), &s, &look(s.style));
+        let label_x = |row: usize| -> Vec<f32> { laid[row].pieces.iter().filter(|p| p.label).map(|p| p.x).collect() };
+        assert_eq!(label_x(0), label_x(1));
     }
 
     #[test]
