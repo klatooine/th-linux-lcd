@@ -66,4 +66,4 @@ The [docs](docs/) folder covers the USB protocol and how it was reverse-engineer
 
 ## License
 
-MIT. The overlay fonts in `assets/fonts/` (Sniglet, VT323, Metal Mania) are under the SIL Open Font License; see each folder's `OFL.txt`.
+MIT. The overlay fonts in `assets/fonts/` keep their own licences: Sniglet, VT323 and Metal Mania are under the SIL Open Font License, and Luckiest Guy is under the Apache License 2.0. See each folder.

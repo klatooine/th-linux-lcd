@@ -6,8 +6,9 @@
 //! (premultiplied RGBA for a horizontal band of the screen), which is then
 //! blended onto each frame.
 //!
-//! Fonts: Hack (bundled with egui) for Terminal; Sniglet, VT323 and Metal Mania
-//! (SIL OFL, see `assets/fonts/`) for Kawaii, Retro and Heavy metal.
+//! Fonts: Hack (bundled with egui) for Terminal; Sniglet, VT323, Metal Mania
+//! (SIL OFL) and Luckiest Guy (Apache 2.0) from `assets/fonts/` for Kawaii,
+//! Retro, Heavy metal and Saiyan.
 
 use crate::shared::{Metrics, OverlaySettings, OverlayStyle, Stat, LCD_SIZE, STREAM_FRAME_BUDGET};
 use ab_glyph::{point, Font, FontRef, PxScale, ScaleFont};
@@ -30,6 +31,7 @@ enum FontKind {
     Sniglet,
     Vt323,
     MetalMania,
+    LuckiestGuy,
 }
 
 impl FontKind {
@@ -41,11 +43,15 @@ impl FontKind {
         static SNIGLET: OnceLock<FontRef<'static>> = OnceLock::new();
         static VT323: OnceLock<FontRef<'static>> = OnceLock::new();
         static METAL: OnceLock<FontRef<'static>> = OnceLock::new();
+        static LUCKIEST: OnceLock<FontRef<'static>> = OnceLock::new();
         match self {
             FontKind::Hack => load(&HACK, epaint_default_fonts::HACK_REGULAR),
             FontKind::Sniglet => load(&SNIGLET, include_bytes!("../assets/fonts/sniglet/Sniglet-ExtraBold.ttf")),
             FontKind::Vt323 => load(&VT323, include_bytes!("../assets/fonts/vt323/VT323-Regular.ttf")),
             FontKind::MetalMania => load(&METAL, include_bytes!("../assets/fonts/metalmania/MetalMania-Regular.ttf")),
+            FontKind::LuckiestGuy => {
+                load(&LUCKIEST, include_bytes!("../assets/fonts/luckiestguy/LuckiestGuy-Regular.ttf"))
+            }
         }
     }
 
@@ -223,6 +229,26 @@ fn sd_capsule(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32, r: f32) -> f
     ((pax - bax * h).powi(2) + (pay - bay * h).powi(2)).sqrt() - r
 }
 
+/// Five-pointed star centred at (cx, cy), point up; `r` outer radius, `rf`
+/// inner/outer ratio (after Inigo Quilez's sdStar5).
+fn sd_star5(px: f32, py: f32, cx: f32, cy: f32, r: f32, rf: f32) -> f32 {
+    let (k1x, k1y) = (0.809_017_f32, -0.587_785_f32);
+    let (k2x, k2y) = (-k1x, k1y);
+    let (mut x, mut y) = ((px - cx).abs(), cy - py); // y up
+    let d1 = (k1x * x + k1y * y).max(0.0);
+    x -= 2.0 * d1 * k1x;
+    y -= 2.0 * d1 * k1y;
+    let d2 = (k2x * x + k2y * y).max(0.0);
+    x -= 2.0 * d2 * k2x;
+    y -= 2.0 * d2 * k2y;
+    x = x.abs();
+    y -= r;
+    let (bax, bay) = (rf * -k1y, rf * k1x - 1.0);
+    let t = ((x * bax + y * bay) / (bax * bax + bay * bay)).clamp(0.0, r);
+    let (dx, dy) = (x - bax * t, y - bay * t);
+    (dx * dx + dy * dy).sqrt() * (y * bax - x * bay).signum()
+}
+
 fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
     let qx = (px - cx).abs() - (hw - r);
     let qy = (py - cy).abs() - (hh - r);
@@ -234,27 +260,81 @@ fn sd_round_rect(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -
 /// Pixel bounds of a drawn glyph: (x0, y0, x1, y1).
 type GlyphBox = [f32; 4];
 
+/// Per-letter tilt (degrees) and baseline lift (fraction of the text size)
+/// for bouncy, hand-lettered titles (Saiyan style).
+const BOUNCE: [(f32, f32); 6] = [(-6.0, 0.0), (4.5, -0.05), (-3.0, 0.035), (6.0, -0.03), (-4.5, 0.045), (2.5, -0.02)];
+
+/// Bilinear sample of a coverage buffer (0 outside).
+fn bilinear(buf: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let at = |xi: f32, yi: f32| {
+        if xi < 0.0 || yi < 0.0 || xi >= w as f32 || yi >= h as f32 {
+            0.0
+        } else {
+            buf[yi as usize * w + xi as usize]
+        }
+    };
+    let top = at(x0, y0) * (1.0 - fx) + at(x0 + 1.0, y0) * fx;
+    let bottom = at(x0, y0 + 1.0) * (1.0 - fx) + at(x0 + 1.0, y0 + 1.0) * fx;
+    top * (1.0 - fy) + bottom * fy
+}
+
 /// Draw a placed piece of text in the style's font; `lk.bold` lists extra
 /// horizontal offsets (faux bold). Glyph bounds are appended to `boxes`.
-fn draw_text(mask: &mut Mask, lk: &Look, p: &Placed, boxes: &mut Vec<GlyphBox>) {
+/// In the Saiyan style letters bounce and tilt, and '°' becomes a dragon ball
+/// (centre and radius appended to `balls`).
+fn draw_text(mask: &mut Mask, lk: &Look, p: &Placed, boxes: &mut Vec<GlyphBox>, balls: &mut Vec<[f32; 3]>) {
     let scale = PxScale::from(p.px);
     let base = lk.font.font().as_scaled(scale);
     let baseline = p.cy + (base.ascent() + base.descent()) / 2.0;
     let mut pen = p.x;
-    for c in p.text.chars() {
+    for (i, c) in p.text.chars().enumerate() {
         let f = lk.font.for_char(c).font();
         let id = f.glyph_id(c);
+        let adv = f.as_scaled(scale).h_advance(id);
+        if lk.saiyan && c == '°' {
+            let r = 0.2 * p.px;
+            let (bx, by) = (pen + r + 0.06 * p.px, p.cy - 0.24 * p.px);
+            balls.push([bx, by, r]);
+            mask.fill_sdf(bx - r, by - r, bx + r, by + r, |x, y| ((x - bx).powi(2) + (y - by).powi(2)).sqrt() - r);
+            pen += adv;
+            continue;
+        }
+        let (tilt, lift) = if lk.saiyan { BOUNCE[(i + p.text.len()) % BOUNCE.len()] } else { (0.0, 0.0) };
         for &dx in lk.bold {
-            let glyph = id.with_scale_and_position(scale, point(pen + dx, baseline));
-            if let Some(outlined) = f.outline_glyph(glyph) {
-                let b = outlined.px_bounds();
-                if dx == 0.0 {
-                    boxes.push([b.min.x, b.min.y, b.max.x, b.max.y]);
-                }
+            let glyph = id.with_scale_and_position(scale, point(pen + dx, baseline + lift * p.px));
+            let Some(outlined) = f.outline_glyph(glyph) else { continue };
+            let b = outlined.px_bounds();
+            if dx == 0.0 {
+                boxes.push([b.min.x, b.min.y, b.max.x, b.max.y]);
+            }
+            if tilt == 0.0 {
                 outlined.draw(|gx, gy, cov| mask.plot(b.min.x as i64 + gx as i64, b.min.y as i64 + gy as i64, cov));
+                continue;
+            }
+            // Rasterise upright, then rotate about the glyph centre.
+            let (w, h) = ((b.width().ceil() as usize).max(1), (b.height().ceil() as usize).max(1));
+            let mut buf = vec![0f32; w * h];
+            outlined.draw(|gx, gy, cov| {
+                let (gx, gy) = (gx as usize, gy as usize);
+                if gx < w && gy < h {
+                    buf[gy * w + gx] = cov;
+                }
+            });
+            let (cx, cy) = ((b.min.x + b.max.x) / 2.0, (b.min.y + b.max.y) / 2.0);
+            let (sin, cos) = tilt.to_radians().sin_cos();
+            let reach = ((w * w + h * h) as f32).sqrt() / 2.0 + 1.0;
+            for y in (cy - reach).floor() as i64..=(cy + reach).ceil() as i64 {
+                for x in (cx - reach).floor() as i64..=(cx + reach).ceil() as i64 {
+                    let (rx, ry) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                    let sx = cos * rx + sin * ry + cx - b.min.x - 0.5;
+                    let sy = -sin * rx + cos * ry + cy - b.min.y - 0.5;
+                    mask.plot(x, y, bilinear(&buf, w, h, sx, sy));
+                }
             }
         }
-        pen += f.as_scaled(scale).h_advance(id);
+        pen += adv;
     }
 }
 
@@ -281,6 +361,8 @@ struct Look {
     terminal: bool,
     /// Dashboard layout: small label centred above a big value in each column.
     stacked: bool,
+    /// Bouncy letters and a dragon-ball degree sign.
+    saiyan: bool,
 }
 
 fn look(style: OverlayStyle) -> Look {
@@ -293,12 +375,16 @@ fn look(style: OverlayStyle) -> Look {
         col_gap,
         terminal,
         stacked,
+        saiyan: false,
     };
     match style {
         OverlayStyle::Terminal => l(FontKind::Hack, 1.0, 1.0, &[0.0, 1.0], 1.55, 0.75, false, false),
         OverlayStyle::RetroClock => l(FontKind::Vt323, 1.3, 1.3, &[0.0, 0.5], 1.25, 0.9, true, false),
         OverlayStyle::HeavyMetal => l(FontKind::MetalMania, 1.75, 1.0, &[0.0, 0.6], 0.12, 0.8, false, true),
         OverlayStyle::Kawaii => l(FontKind::Sniglet, 1.6, 0.9, &[0.0], 0.2, 0.75, false, true),
+        OverlayStyle::Saiyan => {
+            Look { saiyan: true, ..l(FontKind::LuckiestGuy, 1.6, 0.95, &[0.0], 0.22, 0.8, false, true) }
+        }
     }
 }
 
@@ -482,10 +568,11 @@ impl Layer {
         let mut labels = Mask::new(y0, h);
         let mut values = Mask::new(y0, h);
         let mut boxes: Vec<GlyphBox> = Vec::new();
+        let mut balls: Vec<[f32; 3]> = Vec::new();
         for row in &laid {
             for p in &row.pieces {
                 let m = if p.label { &mut labels } else { &mut values };
-                draw_text(m, &lk, p, &mut boxes);
+                draw_text(m, &lk, p, &mut boxes, &mut balls);
             }
         }
         let text = labels.union(&values);
@@ -497,9 +584,16 @@ impl Layer {
                 .min_by(|&a, &b| (laid[a].cy - y as f32).abs().total_cmp(&(laid[b].cy - y as f32).abs()))
                 .unwrap_or(0)
         };
-        let row_t = |y: usize| -> f32 {
-            let r = &laid[nearest_row(y)];
-            (y as f32 - (r.cy - r.height * 0.42)) / (r.height * 0.84).max(1.0)
+        // Position within the nearest text line (label or value), 0 = top of the
+        // letters, 1 = bottom, so every line gets the full gradient.
+        let lines: Vec<(f32, f32)> = laid.iter().flat_map(|r| r.pieces.iter().map(|p| (p.cy, p.px))).collect();
+        let line_t = |y: usize| -> f32 {
+            let (cy, px) = lines
+                .iter()
+                .copied()
+                .min_by(|a, b| (a.0 - y as f32).abs().total_cmp(&(b.0 - y as f32).abs()))
+                .unwrap_or((y as f32, 1.0));
+            (y as f32 - (cy - px * 0.42)) / (px * 0.84).max(1.0)
         };
 
         match s.style {
@@ -564,7 +658,7 @@ impl Layer {
                 shadow = shadow.minus(&solid);
                 canvas.over(&shadow, 0.55, |_, _| hex(0x000000));
                 canvas.over(&solid.dilate(1.2 * k), 0.9, |_, _| hex(0x0b0f16)); // thin border
-                canvas.over(&side, 1.0, |_, y| ramp(&[(0.0, 0x3c4a5c), (1.0, 0x151b24)], row_t(y)));
+                canvas.over(&side, 1.0, |_, y| ramp(&[(0.0, 0x3c4a5c), (1.0, 0x151b24)], line_t(y)));
                 let chrome = [
                     (0.0, 0xffffff),
                     (0.28, 0xe3edf8),
@@ -574,7 +668,7 @@ impl Layer {
                     (0.85, 0x9eb5cc),
                     (1.0, 0xdbe6f2),
                 ];
-                canvas.over(&text, 1.0, |_, y| ramp(&chrome, row_t(y)));
+                canvas.over(&text, 1.0, |_, y| ramp(&chrome, line_t(y)));
                 // Bevel: light on top-left edges, dark on bottom-right edges.
                 canvas.over(&text.minus(&text.shifted(1, 1)), 0.75, |_, _| hex(0xffffff));
                 canvas.over(&text.minus(&text.shifted(-1, -1)), 0.6, |_, _| hex(0x10161f));
@@ -592,7 +686,7 @@ impl Layer {
                 let blue = [(0.0, 0xa8e2ff), (0.45, 0x74c6f6), (1.0, 0x4aa2e8)];
                 let row_of = |y: usize| nearest_row(y);
                 canvas.over(&shade, 1.0, |_, y| if row_of(y) == 0 { hex(0xc8338a) } else { hex(0x2f6fc4) });
-                canvas.over(&text, 1.0, |_, y| ramp(if row_of(y) == 0 { &pink } else { &blue }, row_t(y)));
+                canvas.over(&text, 1.0, |_, y| ramp(if row_of(y) == 0 { &pink } else { &blue }, line_t(y)));
                 // Glossy highlight on each glyph, kept inside the letter.
                 let mut gloss = Mask::new(y0, h);
                 for &[gx0, gy0, gx1, gy1] in &boxes {
@@ -609,6 +703,43 @@ impl Layer {
                     });
                 }
                 canvas.over(&gloss.within(&text), 0.85, |_, _| hex(0xffffff));
+            }
+
+            OverlayStyle::Saiyan => {
+                // Anime title lettering: drop shadow, thick black outline, gold values,
+                // orange-red labels, and dragon balls for degree signs.
+                let outline = text.dilate(3.2 * k);
+                let shadow = text.shifted((2.5 * k) as i64, (3.5 * k) as i64).dilate(3.5 * k).minus(&outline);
+                canvas.over(&shadow, 0.5, |_, _| hex(0x000000));
+                canvas.over(&outline, 1.0, |_, _| hex(0x140800));
+                let gold = [(0.0, 0xfff36b), (0.35, 0xffd21a), (0.75, 0xff9a00), (1.0, 0xff6a00)];
+                let red = [(0.0, 0xffb43a), (0.45, 0xff5a1f), (1.0, 0xc4120f)];
+                canvas.over(&labels, 1.0, |_, y| ramp(&red, line_t(y)));
+                canvas.over(&values, 1.0, |_, y| ramp(&gold, line_t(y)));
+                for &[bx, by, r] in &balls {
+                    let mut sphere = Mask::new(y0, h);
+                    sphere.fill_sdf(bx - r, by - r, bx + r, by + r, |x, y| {
+                        ((x - bx).powi(2) + (y - by).powi(2)).sqrt() - r
+                    });
+                    // Lit from the upper left.
+                    let (hx, hy) = (bx - 0.35 * r, by - 0.4 * r);
+                    let orb = [(0.0, 0xfff3c4), (0.35, 0xffc23d), (0.75, 0xff8c0a), (1.0, 0xd9570a)];
+                    canvas.over(&sphere, 1.0, |x, y| {
+                        let d = ((x as f32 + 0.5 - hx).powi(2) + (y as f32 + 0.5 - hy).powi(2)).sqrt();
+                        ramp(&orb, d / (1.5 * r))
+                    });
+                    let mut star = Mask::new(y0, h);
+                    star.fill_sdf(bx - r, by - r, bx + r, by + r, |x, y| {
+                        sd_star5(x, y, bx, by + 0.03 * r, 0.52 * r, 0.42)
+                    });
+                    canvas.over(&star, 1.0, |_, _| hex(0xd6181e));
+                    let mut shine = Mask::new(y0, h);
+                    let (sx, sy, sr) = (bx - 0.42 * r, by - 0.45 * r, 0.17 * r);
+                    shine.fill_sdf(sx - sr, sy - sr, sx + sr, sy + sr, |x, y| {
+                        ((x - sx).powi(2) + (y - sy).powi(2)).sqrt() - sr
+                    });
+                    canvas.over(&shine, 0.9, |_, _| hex(0xffffff));
+                }
             }
         }
 
@@ -705,7 +836,7 @@ mod tests {
 
     #[test]
     fn bundled_fonts_load_and_cover_stats() {
-        for fk in [FontKind::Hack, FontKind::Sniglet, FontKind::Vt323, FontKind::MetalMania] {
+        for fk in [FontKind::Hack, FontKind::Sniglet, FontKind::Vt323, FontKind::MetalMania, FontKind::LuckiestGuy] {
             for c in "0123456789.%CPULIQGRAM> ".chars() {
                 assert_ne!(fk.font().glyph_id(c).0, 0, "{fk:?} lacks {c:?}");
             }

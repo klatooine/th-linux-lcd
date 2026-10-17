@@ -278,11 +278,19 @@ pub enum OverlayStyle {
     HeavyMetal,
     /// Puffy pink/blue bubble letters with gloss and a sticker outline.
     Kawaii,
+    /// Bouncy anime-title lettering: gold/red gradient, thick black outline,
+    /// and a dragon-ball degree sign.
+    Saiyan,
 }
 
 impl OverlayStyle {
-    pub const ALL: [OverlayStyle; 4] =
-        [OverlayStyle::Terminal, OverlayStyle::RetroClock, OverlayStyle::HeavyMetal, OverlayStyle::Kawaii];
+    pub const ALL: [OverlayStyle; 5] = [
+        OverlayStyle::Terminal,
+        OverlayStyle::RetroClock,
+        OverlayStyle::HeavyMetal,
+        OverlayStyle::Kawaii,
+        OverlayStyle::Saiyan,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -290,6 +298,7 @@ impl OverlayStyle {
             OverlayStyle::RetroClock => "RETRO",
             OverlayStyle::HeavyMetal => "METAL",
             OverlayStyle::Kawaii => "KAWAII",
+            OverlayStyle::Saiyan => "SAIYAN",
         }
     }
 }
