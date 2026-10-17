@@ -406,8 +406,44 @@ struct RowLayout {
     pieces: Vec<Placed>,
 }
 
-/// Lay out the stats as a grid: cells in the same column line up across rows.
+/// Re-flow into fewer columns only if that makes the text at least this much bigger.
+const REFLOW_GAIN: f32 = 1.15;
+
+/// Lay out the stats. The default grid has temperatures over loads. Above the
+/// default size, when the round screen would force that grid to shrink a lot,
+/// the stats are re-flowed (temperatures | loads as two columns, or a single
+/// column) if that shows them noticeably bigger.
 fn layout(rows: &[Vec<Item>], s: &OverlaySettings, lk: &Look) -> Vec<RowLayout> {
+    let mut best = layout_grid(rows, s, lk);
+    // At the default size or smaller, always keep the default grid.
+    if s.size <= 1.0 {
+        return best.1;
+    }
+    let flat: Vec<Item> = rows.iter().flatten().cloned().collect();
+    let mut candidates: Vec<Vec<Vec<Item>>> = Vec::new();
+    if rows.len() == 2 {
+        // Two columns: temperatures on the left, loads on the right.
+        let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+        candidates.push((0..n).map(|i| rows.iter().filter_map(|r| r.get(i).cloned()).collect()).collect());
+    } else if flat.len() > 2 {
+        candidates.push(flat.chunks(2).map(<[Item]>::to_vec).collect());
+    }
+    if flat.len() > 1 {
+        candidates.push(flat.chunks(1).map(<[Item]>::to_vec).collect());
+    }
+    for grid in candidates {
+        let candidate = layout_grid(&grid, s, lk);
+        if candidate.0 > best.0 * REFLOW_GAIN {
+            best = candidate;
+        }
+    }
+    best.1
+}
+
+/// Lay out one arrangement as a grid (cells in the same column line up across
+/// rows), scaled to fit the circle. Returns the scale factor applied to the
+/// requested size (1.0 = no shrinking) and the placed rows.
+fn layout_grid(rows: &[Vec<Item>], s: &OverlaySettings, lk: &Look) -> (f32, Vec<RowLayout>) {
     let base = BASE_PX * s.size;
     let (vpx, lpx) = (base * lk.value_px, base * lk.label_px);
     let w = |t: &str, px: f32| text_width(lk.font, t, px);
@@ -428,34 +464,40 @@ fn layout(rows: &[Vec<Item>], s: &OverlaySettings, lk: &Look) -> Vec<RowLayout> 
     let total = prompt + col_w.iter().sum::<f32>() + gap * cols.saturating_sub(1) as f32 + cursor;
 
     // Vertical: each grid row is one line (inline) or label line + value line (stacked).
+    let n = rows.len() as f32;
     let label_drop = if lk.stacked { lpx * 0.55 + vpx * 0.5 } else { 0.0 };
     let row_h = if lk.stacked { lpx + vpx } else { vpx };
     let pitch = if lk.stacked { row_h + vpx * lk.row_gap } else { vpx * lk.row_gap };
-    let block_h = pitch * (rows.len() as f32 - 1.0) + row_h;
-    // Keep the block away from the round edge, where the circle gets too narrow.
-    let (min_c, max_c) = (SAFE_TOP + block_h / 2.0, SIZE as f32 - SAFE_TOP - block_h / 2.0);
-    let vy = (s.vertical * SIZE as f32).clamp(min_c.min(max_c), max_c.max(min_c));
-    let first = vy - pitch * (rows.len() as f32 - 1.0) / 2.0;
-    // Value-line centres (stacked: the value sits below its label).
-    let centers: Vec<f32> = (0..rows.len()).map(|i| first + i as f32 * pitch + label_drop / 2.0).collect();
+    let block_h = pitch * (n - 1.0) + row_h;
 
-    // One scale for the whole grid so columns stay aligned: the tightest row decides.
+    // One scale for the whole grid so columns stay aligned. The width allowed
+    // depends on where the rows end up, which depends on the scale, so iterate.
     let r = SIZE as f32 / 2.0;
-    let k = centers
-        .iter()
-        .map(|&cy| {
-            let dy = (cy - r).abs() + vpx / 2.0;
-            let chord = 2.0 * (r * r - dy * dy).max(0.0).sqrt() - 2.0 * EDGE_MARGIN;
-            if total > chord && chord > 0.0 {
-                chord / total
-            } else {
-                1.0
-            }
-        })
-        .fold(1.0, f32::min);
+    let fit_h = (SIZE as f32 - 2.0 * SAFE_TOP) / block_h;
+    let mut k = 1.0f32;
+    let mut centers = Vec::new();
+    for _ in 0..4 {
+        let block = block_h * k;
+        // Keep the block away from the round edge, where the circle gets too narrow.
+        let (min_c, max_c) = (SAFE_TOP + block / 2.0, SIZE as f32 - SAFE_TOP - block / 2.0);
+        let vy = (s.vertical * SIZE as f32).clamp(min_c.min(max_c), max_c.max(min_c));
+        let first = vy - pitch * k * (n - 1.0) / 2.0;
+        // Value-line centres (stacked: the value sits below its label).
+        centers = (0..rows.len()).map(|i| first + i as f32 * pitch * k + label_drop * k / 2.0).collect();
+        let fit_w = centers
+            .iter()
+            .map(|&cy| {
+                let dy = (cy - r).abs() + vpx * k / 2.0;
+                let chord = 2.0 * (r * r - dy * dy).max(0.0).sqrt() - 2.0 * EDGE_MARGIN;
+                (chord / total).max(0.05)
+            })
+            .fold(1.0, f32::min);
+        k = fit_w.min(fit_h).min(1.0);
+    }
 
     let x_start = r - total * k / 2.0;
-    rows.iter()
+    let laid = rows
+        .iter()
         .zip(&centers)
         .map(|(items, &cy)| {
             let mut pieces = Vec::new();
@@ -491,7 +533,8 @@ fn layout(rows: &[Vec<Item>], s: &OverlaySettings, lk: &Look) -> Vec<RowLayout> 
             }
             RowLayout { cy, height: vpx * k, x0: x_start, x1: x_start + total * k, pieces }
         })
-        .collect()
+        .collect();
+    (k, laid)
 }
 
 // ── Compositing ───────────────────────────────────────────────────────────────
@@ -553,7 +596,6 @@ impl Layer {
     /// Render the overlay. None if there is nothing to draw.
     pub fn render(rows: &[Vec<Item>], settings: &OverlaySettings) -> Option<Self> {
         let s = settings.sanitized();
-        let rows = &rows[..rows.len().min(2)];
         if rows.is_empty() {
             return None;
         }
@@ -688,8 +730,8 @@ impl Layer {
                 let pink = [(0.0, 0xffa8dc), (0.45, 0xff7cc8), (1.0, 0xff4fb0)];
                 let blue = [(0.0, 0xa8e2ff), (0.45, 0x74c6f6), (1.0, 0x4aa2e8)];
                 let row_of = |y: usize| nearest_row(y);
-                canvas.over(&shade, 1.0, |_, y| if row_of(y) == 0 { hex(0xc8338a) } else { hex(0x2f6fc4) });
-                canvas.over(&text, 1.0, |_, y| ramp(if row_of(y) == 0 { &pink } else { &blue }, line_t(y)));
+                canvas.over(&shade, 1.0, |_, y| if row_of(y) % 2 == 0 { hex(0xc8338a) } else { hex(0x2f6fc4) });
+                canvas.over(&text, 1.0, |_, y| ramp(if row_of(y) % 2 == 0 { &pink } else { &blue }, line_t(y)));
                 // Glossy highlight on each glyph, kept inside the letter.
                 let mut gloss = Mask::new(y0, h);
                 for &[gx0, gy0, gx1, gy1] in &boxes {
@@ -942,6 +984,23 @@ mod tests {
         // A full turn is the identity.
         assert_eq!(blend(&layer.clone().rotated_cw(360)), blend(&layer.clone().rotated_cw(90).rotated_cw(270)));
         assert_eq!(blend(&layer.clone().rotated_cw(0)), blend(&layer));
+    }
+
+    #[test]
+    fn larger_sizes_give_larger_text() {
+        let biggest = |style, size| {
+            let s = OverlaySettings { style, size, ..all_on() };
+            layout(&rows(&metrics(), &s), &s, &look(style))
+                .iter()
+                .flat_map(|r| &r.pieces)
+                .filter(|p| !p.label)
+                .map(|p| p.px)
+                .fold(0.0, f32::max)
+        };
+        for style in OverlayStyle::ALL {
+            let (normal, max) = (biggest(style, 1.0), biggest(style, *OVERLAY_SIZE_RANGE.end()));
+            assert!(max > normal * 1.2, "{style:?}: {normal} -> {max}");
+        }
     }
 
     #[test]
