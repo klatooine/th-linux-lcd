@@ -2,5 +2,7 @@
 //! and media import. Shared by the app binary and the `test_boot` example.
 
 pub mod import;
+pub mod metrics;
+pub mod overlay;
 pub mod shared;
 pub mod usb;

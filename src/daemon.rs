@@ -11,7 +11,9 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use th_linux_lcd::shared::{self, Cmd, DaemonStatus, Resp};
+use th_linux_lcd::metrics::Sampler;
+use th_linux_lcd::overlay::{self, Layer};
+use th_linux_lcd::shared::{self, Cmd, DaemonStatus, Metrics, OverlaySettings, Resp};
 use th_linux_lcd::usb;
 
 const DEVICE_RETRY: Duration = Duration::from_secs(2);
@@ -24,6 +26,8 @@ const QUICK_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// written to flash long after the user asked for it.
 const UPLOAD_START_DEADLINE: Duration = Duration::from_secs(10);
 const QUEUE_DEPTH: usize = 32;
+/// How often sensors (coolant, CPU, GPU, RAM) are sampled.
+const METRICS_POLL: Duration = Duration::from_secs(2);
 
 static QUIT: AtomicBool = AtomicBool::new(false);
 
@@ -37,6 +41,7 @@ enum UsbCmd {
     },
     Stop,
     Screen(bool),
+    SetOverlay(OverlaySettings),
     Upload {
         slot: usb::Slot,
         data: Vec<u8>,
@@ -141,6 +146,23 @@ struct FlashSettle {
     reply: Option<Reply>,
 }
 
+/// Overlay rendered for the current text, plus each stream frame with the
+/// overlay applied (filled lazily, one frame at a time, as frames are sent).
+#[derive(Default)]
+struct OverlayCache {
+    key: String,
+    layer: Option<Layer>,
+    frames: Vec<Option<Vec<u8>>>,
+    quality: u8,
+    error_logged: bool,
+}
+
+impl OverlayCache {
+    fn reset_frames(&mut self, n: usize) {
+        self.frames = vec![None; n];
+    }
+}
+
 struct UsbThread {
     rx: Receiver<Job>,
     status: Arc<Mutex<DaemonStatus>>,
@@ -153,6 +175,12 @@ struct UsbThread {
     autoplay_checked: bool,
     settle: Option<FlashSettle>,
     quitting: bool,
+    sampler: Sampler,
+    metrics: Metrics,
+    next_metrics: Instant,
+    coolant_probed: bool,
+    overlay: OverlaySettings,
+    cache: OverlayCache,
 }
 
 impl UsbThread {
@@ -169,6 +197,12 @@ impl UsbThread {
             autoplay_checked: false,
             settle: None,
             quitting: false,
+            sampler: Sampler::default(),
+            metrics: Metrics::default(),
+            next_metrics: Instant::now(),
+            coolant_probed: false,
+            overlay: shared::load_overlay_settings(&shared::data_dir()),
+            cache: OverlayCache { quality: overlay::initial_quality(), ..Default::default() },
         }
     }
 
@@ -177,6 +211,7 @@ impl UsbThread {
             let now = Instant::now();
             self.ensure_device(now);
             self.finish_settle(now);
+            self.poll_metrics(now);
             if QUIT.load(Ordering::Relaxed) {
                 self.quitting = true;
             }
@@ -215,7 +250,56 @@ impl UsbThread {
         } else if let Some(s) = &self.stream {
             wait = wait.min(s.next.saturating_duration_since(now));
         }
-        wait
+        wait.min(self.next_metrics.saturating_duration_since(now))
+    }
+
+    /// Sample host sensors and the pump's coolant temperature.
+    fn poll_metrics(&mut self, now: Instant) {
+        if now < self.next_metrics {
+            return;
+        }
+        self.next_metrics = now + METRICS_POLL;
+        let mut m = self.sampler.sample();
+        if self.device.is_some() && self.settle.is_none() {
+            let probe = !self.coolant_probed;
+            match self.with_device(usb::read_coolant_temp) {
+                Ok((temp, head)) => {
+                    if probe {
+                        // One-off diagnostics so the byte layout can be checked on other units.
+                        eprintln!("[usb] status poll 0x82 reply: {head:02x?} -> coolant {temp:?} °C");
+                        self.coolant_probed = true;
+                    }
+                    m.coolant = temp;
+                }
+                Err(e) => {
+                    if probe {
+                        eprintln!("[usb] coolant temperature unavailable: {e}");
+                        self.coolant_probed = true;
+                    }
+                }
+            }
+        }
+        self.metrics = m;
+        self.refresh_overlay();
+    }
+
+    /// Re-render the overlay layer if the text or settings changed.
+    fn refresh_overlay(&mut self) {
+        let key = if self.overlay.enabled {
+            overlay::key(&overlay::rows(&self.metrics, &self.overlay), self.overlay.position)
+        } else {
+            String::new()
+        };
+        if key == self.cache.key {
+            return;
+        }
+        self.cache.layer = if self.overlay.enabled {
+            Layer::render(&overlay::rows(&self.metrics, &self.overlay), self.overlay.position)
+        } else {
+            None
+        };
+        self.cache.key = key;
+        self.cache.reset_frames(self.stream.as_ref().map_or(0, |s| s.frames.len()));
     }
 
     fn ensure_device(&mut self, now: Instant) {
@@ -238,6 +322,7 @@ impl UsbThread {
             Ok(dev) => {
                 eprintln!("[usb] device opened");
                 self.device = Some(dev);
+                self.coolant_probed = false;
                 self.last_open_error = None;
                 self.last_presence_check = now;
                 if let Some(s) = &mut self.stream {
@@ -271,6 +356,7 @@ impl UsbThread {
         let fps = shared::sanitize_fps(v.fps).unwrap_or(15.0);
         if !frames.is_empty() {
             eprintln!("[daemon] autoplay: {} ({} frames @ {fps} fps)", v.name, frames.len());
+            self.cache.reset_frames(frames.len());
             self.stream = Some(Stream::new(frames, fps, v.id.clone()));
         }
     }
@@ -307,6 +393,7 @@ impl UsbThread {
                 if let Err(e) = shared::save_autoplay(&data, Some(&id)) {
                     eprintln!("[daemon] autoplay not saved: {e}");
                 }
+                self.cache.reset_frames(frames.len());
                 self.stream = Some(Stream::new(frames, fps, id));
                 Ok(())
             }
@@ -324,6 +411,11 @@ impl UsbThread {
                 } else {
                     self.with_device(|d| usb::set_screen(d, on))
                 }
+            }
+            UsbCmd::SetOverlay(settings) => {
+                self.overlay = settings;
+                self.refresh_overlay();
+                shared::save_overlay_settings(&data, &settings)
             }
             UsbCmd::Upload { slot, data, deadline } => {
                 if Instant::now() > deadline {
@@ -387,7 +479,22 @@ impl UsbThread {
         if now < s.next {
             return;
         }
-        match usb::send_frame(dev, &s.frames[s.idx]) {
+        // With the overlay on, send the frame with stats drawn in (rendered once per text change).
+        let OverlayCache { layer, frames, quality, error_logged, .. } = &mut self.cache;
+        if let (Some(layer), Some(slot @ None)) = (layer.as_ref(), frames.get_mut(s.idx)) {
+            *slot = Some(layer.apply_to_jpeg(&s.frames[s.idx], quality).unwrap_or_else(|e| {
+                if !*error_logged {
+                    eprintln!("[daemon] overlay skipped for a frame: {e}");
+                    *error_logged = true;
+                }
+                s.frames[s.idx].clone()
+            }));
+        }
+        let jpeg = match (layer, frames.get(s.idx)) {
+            (Some(_), Some(Some(rendered))) => rendered.as_slice(),
+            _ => s.frames[s.idx].as_slice(),
+        };
+        match usb::send_frame(dev, jpeg) {
             Ok(()) => {
                 s.idx = (s.idx + 1) % s.frames.len();
                 s.next += s.period;
@@ -409,6 +516,8 @@ impl UsbThread {
             device_found: self.device.is_some(),
             fps: self.stream.as_ref().map_or(0.0, |s| s.fps),
             flash_busy: self.settle.is_some(),
+            metrics: self.metrics,
+            overlay: self.overlay,
         };
         if s != self.published {
             if let Ok(mut st) = self.status.lock() {
@@ -441,6 +550,7 @@ fn dispatch(cmd: Cmd, tx: &SyncSender<Job>, status: &Mutex<DaemonStatus>) -> Res
         Cmd::Stop => (UsbCmd::Stop, QUICK_REPLY_TIMEOUT),
         Cmd::ScreenOn => (UsbCmd::Screen(true), QUICK_REPLY_TIMEOUT),
         Cmd::ScreenOff => (UsbCmd::Screen(false), QUICK_REPLY_TIMEOUT),
+        Cmd::SetOverlay { settings } => (UsbCmd::SetOverlay(settings), QUICK_REPLY_TIMEOUT),
         Cmd::UploadStandby { path } => {
             let data = read_limited(Path::new(&path), shared::MAX_STANDBY_BYTES)?;
             shared::validate_standby_jpeg(&data)?;

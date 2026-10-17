@@ -26,7 +26,7 @@ const CMD_INIT: u8 = 0x0a;
 const CMD_CHUNK: u8 = 0x0b;
 const CMD_SCREEN: u8 = 0x12;
 const CMD_COMMIT: u8 = 0x14;
-const CMD_FINALIZE: u8 = 0x82;
+const CMD_FINALIZE: u8 = 0x82; // also the status poll the Windows app sends every 2 s
 
 const FLAG_FIRST: u8 = 0x80;
 const COMMIT_ARG: u8 = 0x62; // byte[4] of CMD_COMMIT, as sent by the Windows app
@@ -38,6 +38,7 @@ const CHUNK_PKT_DATA: usize = 436;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Largest frame `send_frame` can address (the packet count is a u8).
 pub const MAX_FRAME_BYTES: usize = 255 * FRAME_PAYLOAD;
@@ -174,6 +175,34 @@ pub fn set_screen(dev: &Handle, on: bool) -> Result<()> {
     let mut p = ctrl_packet(CMD_SCREEN, 1, FLAG_FIRST);
     p[4] = if on { BRIGHTNESS_ON } else { 0 };
     write_all(dev, EP_CTRL_OUT, &p)
+}
+
+/// Send a read-only query (`cmd 01 00 80`) and return the reply that echoes
+/// `cmd`, skipping stale replies to earlier commands.
+fn query(dev: &Handle, cmd: u8) -> Result<[u8; CTRL_PKT]> {
+    write_all(dev, EP_CTRL_OUT, &ctrl_packet(cmd, 1, FLAG_FIRST))?;
+    let mut r = [0u8; CTRL_PKT];
+    for _ in 0..4 {
+        match dev.read_interrupt(EP_CTRL_IN, &mut r, QUERY_TIMEOUT) {
+            Ok(n) if n > 0 && r[0] == cmd => return Ok(r),
+            Ok(_) => continue,
+            Err(rusb::Error::Timeout) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::other(format!("no reply to query 0x{cmd:02x}")))
+}
+
+/// Coolant temperature in °C, from the reply to the 0x82 status poll the
+/// Windows app sends every 2 s: bytes 4–5, little-endian, hundredths of a
+/// degree (e.g. `c6 0a` = 27.58 °C). Also returns the first 16 reply bytes for
+/// diagnostics. `None` if the value is implausible.
+pub fn read_coolant_temp(dev: &Handle) -> Result<(Option<f32>, [u8; 16])> {
+    let r = query(dev, CMD_FINALIZE)?;
+    let mut head = [0u8; 16];
+    head.copy_from_slice(&r[..16]);
+    let t = f32::from(u16::from_le_bytes([r[4], r[5]])) / 100.0;
+    Ok(((1.0..100.0).contains(&t).then_some(t), head))
 }
 
 /// Write `data` to a flash slot.

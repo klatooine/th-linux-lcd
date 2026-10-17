@@ -91,6 +91,7 @@ fn send(cmd: Cmd) {
 struct Tray {
     state: State,
     playing: Option<String>,
+    stats: String,
     gui_children: Vec<Child>,
 }
 
@@ -138,7 +139,9 @@ impl ksni::Tray for Tray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip { title: "TH Linux LCD".into(), description: self.status_text(), ..Default::default() }
+        let description =
+            if self.stats.is_empty() { self.status_text() } else { format!("{}\n{}", self.status_text(), self.stats) };
+        ksni::ToolTip { title: "TH Linux LCD".into(), description, ..Default::default() }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -205,7 +208,7 @@ pub fn run() -> i32 {
         }
     };
 
-    let tray = Tray { state: State::NoDaemon, playing: None, gui_children: Vec::new() };
+    let tray = Tray { state: State::NoDaemon, playing: None, stats: String::new(), gui_children: Vec::new() };
     // At login the panel may not be up yet; wait for it instead of failing.
     let handle = match tray.assume_sni_available(true).spawn() {
         Ok(h) => h,
@@ -224,6 +227,7 @@ pub fn run() -> i32 {
             _ => None,
         };
         let state = State::from_status(status.as_ref());
+        let stats = status.as_ref().map(|s| s.metrics.summary()).unwrap_or_default();
         let id = status.and_then(|s| s.playing_id);
         if id != playing_id {
             playing_name = id
@@ -236,6 +240,7 @@ pub fn run() -> i32 {
             t.reap();
             t.state = state;
             t.playing = name;
+            t.stats = stats;
         });
         std::thread::sleep(POLL);
     }

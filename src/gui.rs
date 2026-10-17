@@ -14,9 +14,10 @@ use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use th_linux_lcd::import;
+use th_linux_lcd::overlay::{self, Layer};
 use th_linux_lcd::shared::{
     self, daemon_cmd, decode_thumbnail, frame_file, frames_dir, make_thumbnail, rotated_frames_dir, socket_path,
-    BootAnim, Cmd, DaemonStatus, OnDevice, Resp, StandbyImage, Video,
+    BootAnim, Cmd, DaemonStatus, OnDevice, OverlayPosition, Resp, StandbyImage, Stat, Video,
 };
 use uuid::Uuid;
 
@@ -138,6 +139,18 @@ fn icon_button(ui: &mut egui::Ui, enabled: bool, glyph: &str, hint: &str) -> boo
     )
     .on_hover_text(hint)
     .clicked()
+}
+
+/// Small on/off chip: filled green when `on`.
+fn toggle_chip(ui: &mut egui::Ui, enabled: bool, label: &str, on: bool, min_width: f32) -> egui::Response {
+    let lit = enabled && on;
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(mono(label, 9.5, if lit { GREEN } else { TEXT_FAINT }))
+            .fill(if lit { GREEN_DIM } else { BG_CARD })
+            .stroke(Stroke::new(1.0_f32, if lit { GREEN_MID } else { BORDER }))
+            .min_size(Vec2::new(min_width, 24.0)),
+    )
 }
 
 /// Rounded tag, e.g. "ON LCD".
@@ -357,6 +370,8 @@ pub struct App {
     daemon_child: Option<Child>,
     confirm: Option<Confirm>,
     instance: GuiInstance,
+    /// Overlay layer for the animation preview, keyed by its text.
+    preview_layer: (String, Option<Layer>),
 }
 
 fn daemon_reachable() -> bool {
@@ -547,6 +562,7 @@ impl App {
             daemon_child: None,
             confirm: None,
             instance,
+            preview_layer: (String::new(), None),
         };
 
         app.ensure_daemon();
@@ -627,9 +643,29 @@ impl App {
         self.thumb_cache.get(id).map(|t| t.id())
     }
 
+    /// The stats overlay as the daemon would draw it right now (None when off).
+    fn current_overlay(&mut self) -> Option<&Layer> {
+        let st = &self.daemon_status;
+        if !st.overlay.enabled {
+            return None;
+        }
+        let rows = overlay::rows(&st.metrics, &st.overlay);
+        let key = overlay::key(&rows, st.overlay.position);
+        if key != self.preview_layer.0 {
+            self.preview_layer = (key, Layer::render(&rows, st.overlay.position));
+        }
+        self.preview_layer.1.as_ref()
+    }
+
     fn set_preview_from_bytes(&mut self, ctx: &egui::Context, name: &str, bytes: &[u8]) {
         if let Ok(img) = image::load_from_memory(bytes) {
-            let rgba = img.to_rgba8();
+            let mut rgba = img.to_rgba8();
+            // Show the animation exactly as the LCD will: with the stats overlay.
+            if self.tab == Tab::Animation && rgba.width() == shared::LCD_SIZE && rgba.height() == shared::LCD_SIZE {
+                if let Some(layer) = self.current_overlay() {
+                    layer.apply(&mut rgba, 4);
+                }
+            }
             let ci = egui::ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], &rgba);
             self.preview_texture = Some(ctx.load_texture(name, ci, TextureOptions::LINEAR));
         }
@@ -1061,6 +1097,10 @@ impl App {
                         if self.daemon_status.streaming && self.daemon_status.fps > 0.0 {
                             ui.label(mono(format!("{:.0} fps", self.daemon_status.fps), 10.0, TEXT_FAINT));
                         }
+                        let summary = self.daemon_status.metrics.summary();
+                        if self.daemon_connected && !summary.is_empty() {
+                            ui.label(mono(summary, 10.0, TEXT_DIM));
+                        }
                     });
                 });
             });
@@ -1270,6 +1310,61 @@ impl App {
         }
     }
 
+    /// "Stats on LCD" card: master switch, position, and one chip per stat
+    /// laid out like the two rows on the display.
+    fn ui_overlay_settings(&mut self, ui: &mut egui::Ui) {
+        let current = self.daemon_status.overlay;
+        let mut next = current;
+        let enabled = self.daemon_connected;
+        card_frame().inner_margin(egui::Margin::symmetric(16.0, 12.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(mono("STATS ON LCD", 10.5, TEXT_DIM));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if toggle_chip(ui, enabled, if next.enabled { "ON" } else { "OFF" }, next.enabled, 48.0)
+                            .clicked()
+                        {
+                            next.enabled = !next.enabled;
+                        }
+                        let on = enabled && next.enabled;
+                        if toggle_chip(ui, on, "TOP", next.position == OverlayPosition::Top, 56.0).clicked() {
+                            next.position = OverlayPosition::Top;
+                        }
+                        if toggle_chip(ui, on, "BOTTOM", next.position == OverlayPosition::Bottom, 56.0).clicked() {
+                            next.position = OverlayPosition::Bottom;
+                        }
+                    });
+                    ui.add_space(2.0);
+                    ui.label(mono("Drawn on streamed GIFs.", 9.0, TEXT_FAINT));
+                });
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    let m = self.daemon_status.metrics;
+                    for row in Stat::ROWS {
+                        ui.horizontal(|ui| {
+                            for stat in row {
+                                // Same short form as on the LCD; full name on hover.
+                                let value = stat.value(&m).unwrap_or_else(|| "--".into());
+                                let label = format!("{} {value}", stat.label());
+                                let chip = toggle_chip(ui, enabled && next.enabled, &label, next.shows(stat), 84.0);
+                                if chip.on_hover_text(stat.name()).clicked() {
+                                    next.toggle(stat);
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+        });
+        if next != current {
+            self.daemon_status.overlay = next; // optimistic; the next status poll confirms
+            self.preview_texture = None;
+            self.send(Cmd::SetOverlay { settings: next });
+        }
+    }
+
     fn ui_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let (title, add_label, empty) = match self.tab {
             Tab::Animation => ("ANIMATIONS", "+ ADD GIF", "No animations yet. Add a GIF to stream it to the LCD."),
@@ -1450,6 +1545,10 @@ impl eframe::App for App {
             ctx,
             |ui| {
                 self.ui_hero(ui);
+                if self.tab == Tab::Animation {
+                    ui.add_space(12.0);
+                    self.ui_overlay_settings(ui);
+                }
                 ui.add_space(18.0);
                 self.ui_gallery(ui, ctx);
             },

@@ -48,7 +48,6 @@ Each discovered protocol element was validated by reimplementing it in Rust and 
 | 1 | `0x84` | IN | 16 B | Frame drain (required after each frame) |
 | 0 | `0x01` | OUT | 440 B | Control commands |
 | 0 | `0x82` | IN | 440 B | ACK (echo of command byte at `[0]`) |
-| 0 | `0x81` | IN | 13 B | Status (seen in early traces; not present on every unit, not used) |
 
 ---
 
@@ -122,6 +121,21 @@ This is **fire-and-forget** — EP `0x82` returns 0 bytes. Confirmed from traces
 The meaning of `0x62`, and whether the firmware bounds-checks the INIT size, are unknown. The app therefore validates every container (see [boot-animation.md](boot-animation.md)) and caps it at 1.25 MiB, close to the 1,238,420-byte known-good container from the Windows trace.
 
 The byte `0x62` at position `[4]` was confirmed by iterating values 0x60–0x90 with a probe tool and observing which value matched the Windows trace.
+
+### Status poll (0x82) and coolant temperature
+
+The Windows app sends `[0x82, 0x01, 0x00, 0x80, 0x00…]` every 2 s while it runs. The reply echoes the command and carries the **coolant temperature** in bytes 4–5, little-endian, in hundredths of a degree:
+
+```
+82 01 00 80 c6 0a 00 00 …   → 0x0ac6 = 2758 → 27.58 °C
+82 01 00 80 4e 0c 00 00 …   → 0x0c4e = 3150 → 31.50 °C  (Windows capture, while streaming)
+```
+
+The value rises slowly with load, as liquid temperature does. This app sends the same poll every 2 s to show coolant temperature (in the GUI and in the stats overlay).
+
+Another Linux project for this device reads coolant from query `0x80` (bytes 6–7, big-endian ÷ 1000). On the unit tested here that gives an impossible 2.32 °C, so this app does not use `0x80`.
+
+Note: an earlier version of these notes listed a 13-byte "status" endpoint `0x81`. That traffic in the capture belonged to a different USB device (a mouse), not the LCD. The LCD has only the four endpoints listed above.
 
 ### Finalize
 

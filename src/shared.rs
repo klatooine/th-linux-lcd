@@ -130,12 +130,25 @@ pub fn boot_dir(data: &Path) -> PathBuf {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
 pub enum Cmd {
-    Play { frames_dir: String, fps: f32, frame_count: usize, id: String },
+    Play {
+        frames_dir: String,
+        fps: f32,
+        frame_count: usize,
+        id: String,
+    },
     Stop,
     ScreenOn,
     ScreenOff,
-    UploadStandby { path: String },
-    UploadBoot { path: String },
+    UploadStandby {
+        path: String,
+    },
+    UploadBoot {
+        path: String,
+    },
+    /// Configure the stats overlay drawn onto streamed frames.
+    SetOverlay {
+        settings: OverlaySettings,
+    },
     Status,
 }
 
@@ -166,6 +179,163 @@ pub struct DaemonStatus {
     /// The device is still writing a boot animation to flash.
     #[serde(default)]
     pub flash_busy: bool,
+    #[serde(default)]
+    pub metrics: Metrics,
+    #[serde(default)]
+    pub overlay: OverlaySettings,
+}
+
+/// Latest sensor readings (None = unavailable).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct Metrics {
+    /// CPU package temperature, °C.
+    pub cpu_temp: Option<f32>,
+    /// Coolant (liquid) temperature reported by the pump, °C.
+    pub coolant: Option<f32>,
+    /// GPU temperature, °C.
+    pub gpu_temp: Option<f32>,
+    /// CPU load, %.
+    pub cpu_load: Option<f32>,
+    /// GPU load, %.
+    pub gpu_load: Option<f32>,
+    /// Memory in use, %.
+    pub ram: Option<f32>,
+}
+
+/// One overlay item, in display order: row 1 temperatures, row 2 loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stat {
+    CpuTemp,
+    Coolant,
+    GpuTemp,
+    CpuLoad,
+    GpuLoad,
+    Ram,
+}
+
+impl Stat {
+    pub const ROWS: [[Stat; 3]; 2] =
+        [[Stat::CpuTemp, Stat::Coolant, Stat::GpuTemp], [Stat::CpuLoad, Stat::GpuLoad, Stat::Ram]];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Stat::CpuTemp | Stat::CpuLoad => "CPU",
+            Stat::Coolant => "LIQ",
+            Stat::GpuTemp | Stat::GpuLoad => "GPU",
+            Stat::Ram => "RAM",
+        }
+    }
+
+    /// Long name for settings UIs.
+    pub fn name(self) -> &'static str {
+        match self {
+            Stat::CpuTemp => "CPU temp",
+            Stat::Coolant => "Coolant temp",
+            Stat::GpuTemp => "GPU temp",
+            Stat::CpuLoad => "CPU load",
+            Stat::GpuLoad => "GPU load",
+            Stat::Ram => "RAM load",
+        }
+    }
+
+    /// Formatted value, e.g. "52°" / "23%"; None if unavailable.
+    pub fn value(self, m: &Metrics) -> Option<String> {
+        let temp = |t: Option<f32>| t.map(|t| format!("{t:.0}°"));
+        let pct = |p: Option<f32>| p.map(|p| format!("{p:.0}%"));
+        match self {
+            Stat::CpuTemp => temp(m.cpu_temp),
+            Stat::Coolant => m.coolant.map(|t| format!("{t:.1}°")),
+            Stat::GpuTemp => temp(m.gpu_temp),
+            Stat::CpuLoad => pct(m.cpu_load),
+            Stat::GpuLoad => pct(m.gpu_load),
+            Stat::Ram => pct(m.ram),
+        }
+    }
+}
+
+impl Metrics {
+    /// One-line summary for the status bar / tray, e.g. "CPU 52° · LIQ 31.5° · GPU 45° · …".
+    pub fn summary(&self) -> String {
+        Stat::ROWS
+            .iter()
+            .flatten()
+            .filter_map(|s| s.value(self).map(|v| format!("{} {v}", s.label())))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub enum OverlayPosition {
+    Top,
+    #[default]
+    Bottom,
+}
+
+/// Which stats are drawn onto streamed frames, and where.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OverlaySettings {
+    pub enabled: bool,
+    pub position: OverlayPosition,
+    pub cpu_temp: bool,
+    pub coolant: bool,
+    pub gpu_temp: bool,
+    pub cpu_load: bool,
+    pub gpu_load: bool,
+    pub ram: bool,
+}
+
+impl Default for OverlaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: OverlayPosition::Bottom,
+            cpu_temp: true,
+            coolant: true,
+            gpu_temp: true,
+            cpu_load: true,
+            gpu_load: true,
+            ram: true,
+        }
+    }
+}
+
+impl OverlaySettings {
+    pub fn shows(&self, stat: Stat) -> bool {
+        match stat {
+            Stat::CpuTemp => self.cpu_temp,
+            Stat::Coolant => self.coolant,
+            Stat::GpuTemp => self.gpu_temp,
+            Stat::CpuLoad => self.cpu_load,
+            Stat::GpuLoad => self.gpu_load,
+            Stat::Ram => self.ram,
+        }
+    }
+
+    pub fn toggle(&mut self, stat: Stat) {
+        let flag = match stat {
+            Stat::CpuTemp => &mut self.cpu_temp,
+            Stat::Coolant => &mut self.coolant,
+            Stat::GpuTemp => &mut self.gpu_temp,
+            Stat::CpuLoad => &mut self.cpu_load,
+            Stat::GpuLoad => &mut self.gpu_load,
+            Stat::Ram => &mut self.ram,
+        };
+        *flag = !*flag;
+    }
+}
+
+const OVERLAY_JSON: &str = "overlay.json";
+
+pub fn load_overlay_settings(data: &Path) -> OverlaySettings {
+    fs::read_to_string(data.join(OVERLAY_JSON)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+}
+
+pub fn save_overlay_settings(data: &Path, settings: &OverlaySettings) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    write_atomic(&data.join(OVERLAY_JSON), &json)
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────

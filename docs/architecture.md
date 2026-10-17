@@ -63,6 +63,7 @@ All messages are newline-delimited JSON. The GUI opens a fresh TCP-like connecti
 { "cmd": "ScreenOff" }
 { "cmd": "UploadStandby", "path": "/path/to/image.jpg" }
 { "cmd": "UploadBoot",    "path": "/path/to/anim.bootanim" }
+{ "cmd": "SetOverlay",    "settings": { "enabled": true, "position": "Bottom", "cpu_temp": true, "coolant": true, "gpu_temp": true, "cpu_load": true, "gpu_load": true, "ram": true } }
 { "cmd": "Status" }
 ```
 
@@ -97,6 +98,10 @@ The USB thread owns the device handle and runs an event loop:
 2. Publish `DaemonStatus` when it changes.
 3. Block on the command channel until the next frame is due, the flash-settle period ends, or the next reconnect attempt — whichever is first.
 4. If streaming and a frame is due: `usb::send_frame()`; on error drop the handle and reconnect.
+
+Every 2 s the thread samples host sensors and sends the `0x82` status poll to read coolant temperature (never during an upload or flash settle). The readings go into `DaemonStatus.metrics`.
+
+When the stats overlay is on, each frame is sent with the stats drawn in. The overlay layer is rendered once per change of the displayed text; each frame is then decoded, blended and re-encoded the first time it is sent with that text, and cached until the text changes (about 6 % of one core at 12.5 fps).
 
 After a boot upload commits, the thread enters a 30 s settle period: no frames, no screen commands, no new uploads; the upload reply is sent when it ends.
 
@@ -137,6 +142,8 @@ Imports (file picker + Pillow), rotation re-encoding and uploads run on a backgr
 | `src/usb.rs` | Low-level USB protocol: open, send_frame, set_screen, upload |
 | `src/shared.rs` | IPC types, data model, atomic persistence, boot container build/validate, unit tests |
 | `src/import.rs` | python3/Pillow import scripts (paths passed as argv) |
+| `src/metrics.rs` | Host sensors: CPU temp (hwmon), CPU load (`/proc/stat`), RAM (`/proc/meminfo`), GPU (NVML or amdgpu sysfs) |
+| `src/overlay.rs` | Stats overlay: outlined text rendered with the bundled Hack font, blended onto frames, re-encoded as 4:4:4 JPEG |
 | `examples/test_boot.rs` | Standalone upload tool for debugging the boot animation protocol |
 
 ---
@@ -151,6 +158,7 @@ standby.json     Vec<StandbyImage>
 boot.json        Vec<BootAnim>
 autoplay.json    id of the video to resume when the daemon starts
 on_device.json   ids of the standby image / boot animation last written by the app (the device has no read-back command)
+overlay.json     stats overlay settings (owned by the daemon)
 frames/<id>/     f00001.jpg … fNNNNN.jpg  (extracted animation frames)
 frames/<id>-rotated/                      (cached rotated frames)
 standby/<id>.jpg                          (converted standby images)
