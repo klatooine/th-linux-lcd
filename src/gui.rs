@@ -1373,11 +1373,28 @@ impl App {
             for row in Stat::ROWS {
                 ui.horizontal(|ui| {
                     for stat in row {
-                        // Same short form as on the LCD; full name on hover.
+                        // Same short form as on the LCD. Hidden stats are struck through.
                         let value = stat.value(&m).unwrap_or_else(|| "--".into());
-                        let label = format!("{} {value}", stat.label());
-                        let chip = toggle_chip(ui, on, &label, next.shows(stat), 92.0);
-                        if chip.on_hover_text(stat.name()).clicked() {
+                        let shown = next.shows(stat);
+                        let lit = on && shown;
+                        let mut text =
+                            mono(format!("{} {value}", stat.label()), 9.5, if lit { GREEN } else { TEXT_FAINT });
+                        if !shown {
+                            text = text.strikethrough();
+                        }
+                        let chip = ui.add_enabled(
+                            on,
+                            egui::Button::new(text)
+                                .fill(if lit { GREEN_DIM } else { BG_CARD })
+                                .stroke(Stroke::new(1.0_f32, if lit { GREEN_MID } else { BORDER }))
+                                .min_size(Vec2::new(92.0, 24.0)),
+                        );
+                        let hint = if shown {
+                            format!("{}: shown on the LCD. Click to hide.", stat.name())
+                        } else {
+                            format!("{}: hidden. Click to show on the LCD.", stat.name())
+                        };
+                        if chip.on_hover_text(hint).clicked() {
                             next.toggle(stat);
                             commit = true;
                         }

@@ -21,7 +21,12 @@ const BASE_PX: f32 = 27.0;
 const EDGE_MARGIN: f32 = 22.0;
 /// The stats block stays at least this far from the top/bottom of the screen.
 const SAFE_TOP: f32 = 58.0;
-const QUALITY_START: u8 = 60;
+const QUALITY_START: u8 = 45;
+/// Highest quality used for re-encoded frames.
+const QUALITY_MAX: u8 = 60;
+/// Target size for re-encoded frames: close to the ~14 KB Pillow frames the
+/// LCD has handled for long periods (the importer's own budget is 20 KB).
+const COMPOSE_BUDGET: usize = 16 * 1024;
 
 // ── Fonts ─────────────────────────────────────────────────────────────────────
 
@@ -832,12 +837,12 @@ pub fn compose(jpeg: &[u8], layer: Option<&Layer>, rotation: i32, quality: &mut 
 
     // The budget is a target, not a hard limit: very detailed frames may
     // stay slightly above it even at the lowest quality.
-    let mut q = (*quality).clamp(5, 90);
+    let mut q = (*quality).clamp(5, QUALITY_MAX);
     loop {
         let out = encode(&rgb, q)?;
-        if out.len() <= STREAM_FRAME_BUDGET || q <= 5 {
+        if out.len() <= COMPOSE_BUDGET || q <= 5 {
             // Drift back up when there is plenty of headroom.
-            *quality = if out.len() < STREAM_FRAME_BUDGET * 6 / 10 { (q + 5).min(90) } else { q };
+            *quality = if out.len() < COMPOSE_BUDGET * 6 / 10 { (q + 5).min(QUALITY_MAX) } else { q };
             return Ok(out);
         }
         q = q.saturating_sub(10).max(5);
@@ -861,7 +866,49 @@ fn encode(rgb: &[u8], quality: u8) -> Result<Vec<u8>, String> {
         out[11] = 1;
         out[12] = 1;
     }
-    Ok(out)
+    Ok(pillow_segment_order(out))
+}
+
+/// Reorder the header segments to APP0, DQT, SOF0, DHT, then the scan — the
+/// layout of the Pillow-encoded frames the LCD is known to handle.
+/// jpeg-encoder writes SOF0 before DQT, which is valid JPEG but a likely
+/// trouble spot for a small embedded decoder. Image data is untouched.
+fn pillow_segment_order(jpeg: Vec<u8>) -> Vec<u8> {
+    if jpeg.len() < 4 || jpeg[..2] != [0xFF, 0xD8] {
+        return jpeg;
+    }
+    let mut segments: Vec<(u8, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 2;
+    let scan_start = loop {
+        if i + 4 > jpeg.len() || jpeg[i] != 0xFF {
+            return jpeg; // unexpected layout: leave it alone
+        }
+        let marker = jpeg[i + 1];
+        if marker == 0xDA {
+            break i;
+        }
+        let end = i + 2 + u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        if end > jpeg.len() {
+            return jpeg;
+        }
+        segments.push((marker, i..end));
+        i = end;
+    };
+    let rank = |m: u8| match m {
+        0xE0..=0xEF => 0,
+        0xDB => 1,
+        0xC0 => 2,
+        0xC4 => 3,
+        _ => 4,
+    };
+    segments.sort_by_key(|(m, _)| rank(*m)); // stable: keeps table order within a kind
+    let mut out = Vec::with_capacity(jpeg.len());
+    out.extend_from_slice(&jpeg[..2]);
+    for (_, r) in &segments {
+        out.extend_from_slice(&jpeg[r.clone()]);
+    }
+    out.extend_from_slice(&jpeg[scan_start..]);
+    out
 }
 
 #[cfg(test)]
@@ -988,7 +1035,15 @@ mod tests {
 
         let mut q = initial_quality();
         let out = compose(&jpeg, Some(&layer), 0, &mut q).unwrap();
-        assert!(out.len() <= STREAM_FRAME_BUDGET, "{} bytes", out.len());
+        assert!(out.len() <= COMPOSE_BUDGET, "{} bytes", out.len());
+        // Same header layout as the Pillow frames: APP0, DQT, DQT, SOF0, DHT…, SOS.
+        let mut order = Vec::new();
+        let mut i = 2;
+        while out[i] == 0xFF && out[i + 1] != 0xDA {
+            order.push(out[i + 1]);
+            i += 2 + u16::from_be_bytes([out[i + 2], out[i + 3]]) as usize;
+        }
+        assert_eq!(order, [0xE0, 0xDB, 0xDB, 0xC0, 0xC4, 0xC4, 0xC4, 0xC4]);
         assert_eq!(&out[..2], &[0xFF, 0xD8]);
         assert_eq!(&out[6..13], b"JFIF\0\x01\x01");
         // SOF0: 3 components, each sampling factor 1x1 (4:4:4).

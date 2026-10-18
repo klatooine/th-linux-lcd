@@ -252,7 +252,23 @@ impl UsbThread {
         if self.settle.is_none() {
             eprintln!("[daemon] USB thread stopped");
         }
-        // Dropping the handle releases the interfaces and re-attaches the kernel driver.
+        if self.retry_delay == DEVICE_RETRY {
+            // Healthy: release the interfaces and re-attach the kernel driver now.
+            drop(self.device.take());
+        } else {
+            self.release_device();
+        }
+    }
+
+    /// Give up the device handle without blocking. Releasing it re-attaches the
+    /// kernel HID driver, whose probe can hang for a minute or more on a frozen
+    /// LCD, so that happens on a short-lived thread instead of the USB thread.
+    fn release_device(&mut self) {
+        if let Some(dev) = self.device.take() {
+            if let Err(e) = std::thread::Builder::new().name("usb-release".into()).spawn(move || drop(dev)) {
+                eprintln!("[usb] cannot release device in background: {e}");
+            }
+        }
     }
 
     fn next_wakeup(&self, now: Instant) -> Duration {
@@ -328,7 +344,7 @@ impl UsbThread {
                 self.last_presence_check = now;
                 if !usb::still_connected(dev) {
                     eprintln!("[usb] device disconnected");
-                    self.device = None;
+                    self.release_device();
                 }
             }
             return;
@@ -398,7 +414,7 @@ impl UsbThread {
         f(dev).map_err(|e| {
             if e.device_gone {
                 eprintln!("[usb] device lost: {e}");
-                self.device = None;
+                self.release_device();
             }
             e.msg
         })
@@ -474,7 +490,7 @@ impl UsbThread {
             UsbCmd::Hotplug(false) => {
                 if self.device.as_ref().is_some_and(|d| !usb::still_connected(d)) {
                     eprintln!("[usb] device unplugged");
-                    self.device = None;
+                    self.release_device();
                 }
                 Ok(())
             }
@@ -532,7 +548,7 @@ impl UsbThread {
                 // also makes the kernel's HID driver probe it).
                 self.retry_delay = (self.retry_delay * 2).min(MAX_DEVICE_RETRY);
                 eprintln!("[daemon] frame send failed ({e}); reopening device in {:?}", self.retry_delay);
-                self.device = None;
+                self.release_device();
             }
         }
     }
