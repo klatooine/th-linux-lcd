@@ -866,14 +866,15 @@ fn encode(rgb: &[u8], quality: u8) -> Result<Vec<u8>, String> {
         out[11] = 1;
         out[12] = 1;
     }
-    Ok(pillow_segment_order(out))
+    Ok(pillow_layout(out))
 }
 
-/// Reorder the header segments to APP0, DQT, SOF0, DHT, then the scan — the
-/// layout of the Pillow-encoded frames the LCD is known to handle.
-/// jpeg-encoder writes SOF0 before DQT, which is valid JPEG but a likely
-/// trouble spot for a small embedded decoder. Image data is untouched.
-fn pillow_segment_order(jpeg: Vec<u8>) -> Vec<u8> {
+/// Give the frame the exact header layout of the Pillow-encoded frames the LCD
+/// is known to handle: segments in the order APP0, DQT, SOF0, DHT, then the
+/// scan, and components numbered 1, 2, 3. jpeg-encoder writes SOF0 before DQT
+/// and numbers components from 0; both are valid JPEG but trouble spots for a
+/// small embedded decoder. Image data is untouched.
+fn pillow_layout(jpeg: Vec<u8>) -> Vec<u8> {
     if jpeg.len() < 4 || jpeg[..2] != [0xFF, 0xD8] {
         return jpeg;
     }
@@ -908,7 +909,37 @@ fn pillow_segment_order(jpeg: Vec<u8>) -> Vec<u8> {
         out.extend_from_slice(&jpeg[r.clone()]);
     }
     out.extend_from_slice(&jpeg[scan_start..]);
+    renumber_components(&mut out);
     out
+}
+
+/// Renumber 0-based component ids in SOF0 and SOS to 1-based.
+fn renumber_components(jpeg: &mut [u8]) {
+    let mut i = 2;
+    while i + 4 <= jpeg.len() && jpeg[i] == 0xFF {
+        let marker = jpeg[i + 1];
+        let len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize;
+        // SOF0: P, Y, X, Nf, then (id, sampling, table) per component.
+        // SOS: Ns, then (id, tables) per component.
+        let (count_at, first, stride) = match marker {
+            0xC0 => (i + 9, i + 10, 3),
+            0xDA => (i + 4, i + 5, 2),
+            _ => (0, 0, 0),
+        };
+        if stride > 0 && count_at < jpeg.len() {
+            let n = jpeg[count_at] as usize;
+            let ids: Vec<usize> = (0..n).map(|c| first + c * stride).filter(|&k| k < i + 2 + len).collect();
+            if ids.len() == n && ids.iter().any(|&k| jpeg[k] == 0) {
+                for k in ids {
+                    jpeg[k] += 1;
+                }
+            }
+        }
+        if marker == 0xDA {
+            return;
+        }
+        i += 2 + len;
+    }
 }
 
 #[cfg(test)]
@@ -1044,6 +1075,10 @@ mod tests {
             i += 2 + u16::from_be_bytes([out[i + 2], out[i + 3]]) as usize;
         }
         assert_eq!(order, [0xE0, 0xDB, 0xDB, 0xC0, 0xC4, 0xC4, 0xC4, 0xC4]);
+        // Components numbered 1, 2, 3 in SOF0 and SOS, as Pillow writes them.
+        let sof = out.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
+        assert_eq!([out[sof + 10], out[sof + 13], out[sof + 16]], [1, 2, 3]);
+        assert_eq!([out[i + 5], out[i + 7], out[i + 9]], [1, 2, 3]);
         assert_eq!(&out[..2], &[0xFF, 0xD8]);
         assert_eq!(&out[6..13], b"JFIF\0\x01\x01");
         // SOF0: 3 components, each sampling factor 1x1 (4:4:4).

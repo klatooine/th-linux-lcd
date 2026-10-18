@@ -19,6 +19,9 @@ use th_linux_lcd::usb;
 const DEVICE_RETRY: Duration = Duration::from_secs(2);
 /// Longest wait between reconnect attempts to a device that stopped responding.
 const MAX_DEVICE_RETRY: Duration = Duration::from_secs(60);
+/// Wait this long after the cooler appears before opening it: it enumerates
+/// before its firmware has finished starting up.
+const ARRIVAL_SETTLE: Duration = Duration::from_secs(5);
 const PRESENCE_CHECK: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_CONNECTIONS: usize = 16;
@@ -355,6 +358,15 @@ impl UsbThread {
         self.last_open_attempt = Some(now);
         match usb::open() {
             Ok(dev) => {
+                // Frames sent before the firmware is ready can hang it; use the
+                // device only once it answers the status poll.
+                if let Err(e) = usb::read_coolant_temp(&dev) {
+                    self.retry_delay = (self.retry_delay * 2).min(MAX_DEVICE_RETRY);
+                    eprintln!("[usb] device not ready ({e}); retrying in {:?}", self.retry_delay);
+                    self.device = Some(dev);
+                    self.release_device();
+                    return;
+                }
                 eprintln!("[usb] device opened");
                 self.device = Some(dev);
                 self.coolant_probed = false;
@@ -482,8 +494,8 @@ impl UsbThread {
             UsbCmd::Hotplug(true) => {
                 if self.device.is_none() {
                     eprintln!("[usb] device plugged in");
-                    self.last_open_attempt = None; // open on the next loop iteration
-                    self.retry_delay = DEVICE_RETRY;
+                    self.last_open_attempt = Some(Instant::now());
+                    self.retry_delay = ARRIVAL_SETTLE;
                 }
                 Ok(())
             }
